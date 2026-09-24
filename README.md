@@ -4,68 +4,67 @@ Welcome to **Python-Learning**! This repository is structured as a fast, practic
 
 ---
 
-## 📌 Learning Architecture & Approach
+## 📋 Trackers & Checklists
 
-This repository follows the **70 / 20 / 10 Learning Strategy**:
-- **70% Hands-on Coding**: Executable, concept-focused Python files with inline explanations, edge cases, and exercises.
-- **20% Reading & Concepts**: Deep dive into Python idioms, memory models, typing, async mechanics, and AI architecture patterns.
-- **10% Synthesizing & Projects**: Building 7 progressive real-world projects from CLI utilities to multi-agent RAG platforms.
+This repository maintains two distinct trackers:
 
-> 💡 **JavaScript/TypeScript Developer Context**: Explanations compare Python constructs directly with Node.js/TS equivalents (e.g. `is` vs `===`, LEGB vs Lexical Scope, GIL vs Node Event Loop, `async/await`, Pydantic vs Zod/TypeScript types).
+1. **[MY_LEARNING_CHECKLIST.md](file:///d:/Projects/Python-Learning/MY_LEARNING_CHECKLIST.md)**  
+   👉 **Your personal student tracker**: Mark off items `[x]` as you study, code, and master the interview answers.
+2. **[AGENT_GENERATION_PROGRESS.md](file:///d:/Projects/Python-Learning/AGENT_GENERATION_PROGRESS.md)**  
+   👉 **AI Agent generator tracker**: Shows all files generated, self-test verification status, and pending roadmap phases.
 
 ---
 
-## 🗂️ Folder Structure
+## 📊 High-Level Generation Status: 15 Files Created (Phases 0–2 Complete)
+
+| Phase | Title | Files Created | Self-Tests | Status |
+| :--- | :--- | :--- | :--- | :--- |
+| **Phase 0** | Setup & Environment | 3 | ✅ Passing | **Complete** |
+| **Phase 1** | Python Fundamentals | 7 | ✅ Passing | **Complete** |
+| **Phase 2** | Pythonic Python | 5 | ✅ Passing | **Complete** |
+| **Phase 3** | OOP & Application Code | 0 | ⬜ Pending | Next Up |
+| **Phase 4** | Errors, Files, HTTP & Stdlib | 0 | ⬜ Pending | Queued |
+| **Phase 5** | Professional Tooling | 0 | ⬜ Pending | Queued |
+| **Phase 6** | Async & Concurrency | 0 | ⬜ Pending | Queued |
+| **Phase 7** | Backend with FastAPI | 0 | ⬜ Pending | Queued |
+| **Phase 8** | Database & Production | 0 | ⬜ Pending | Queued |
+| **Phase 9** | Data/AI Foundations | 0 | ⬜ Pending | Queued |
+| **Phase 10** | LLM / AI Engineering | 0 | ⬜ Pending | Queued |
+| **Phase 11** | AI Systems Architecture | 0 | ⬜ Pending | Queued |
+
+---
+
+## ⚡ How to Run Any Concept Script
+
+Every topic file is **standalone, fully executable, and includes automated self-tests**:
+
+```bash
+# Run with Python 3.13:
+python phase_01_fundamentals/01_variables_and_types.py
+python phase_02_pythonic_python/04_decorators_and_context_managers.py
+```
+
+---
+
+## 📁 Repository Layout
 
 ```text
 python-learning/
-├── .agents/
-│   └── skills/
-│       └── python-ai-learning/    # AI LLM Skill definition for roadmap guidance
-│           └── SKILL.md
-├── phase_00_setup/               # Env setup, venv, uv, VS Code
-├── phase_01_fundamentals/        # Types, data structures, control flow, functions
-├── phase_02_pythonic_python/     # Mutability, scope, generators, decorators, typing
-├── phase_03_oop_and_modules/     # OOP, dunder methods, dataclasses, packages
-├── phase_04_errors_files_http/   # Exceptions, logging, pathlib, httpx, JSON
-├── phase_05_tooling_and_testing/ # Pytest, fixtures, mocking, ruff, mypy
-├── phase_06_async_concurrency/   # asyncio, gather, tasks, multithreading vs multiprocessing
-├── phase_07_fastapi_backend/     # REST APIs, Pydantic, dependency injection, auth
-├── phase_08_database_production/ # PostgreSQL, SQLAlchemy, Alembic, Redis, Docker
-├── phase_09_data_ai_foundations/ # NumPy, Pandas, scikit-learn workflow
-├── phase_10_llm_ai_engineering/  # LLM APIs, prompt engineering, embeddings, vector DBs, RAG
-├── phase_11_ai_architecture/     # System design, SSE streaming, AI gateways, agent loops
-└── projects/                     # 7 Practical ladder projects (P1 - P7)
+├── MY_LEARNING_CHECKLIST.md       # 👤 Your personal learning & interview checklist
+├── AGENT_GENERATION_PROGRESS.md   # 🤖 AI Agent code generation tracker
+├── README.md                      # 📖 Master overview
+├── .agents/skills/                # 🧠 AI Skills & Deep-Dive Reference Guides
+├── phase_00_setup/                # ✅ Setup, venv, packages, debugging (3 files)
+├── phase_01_fundamentals/         # ✅ Types, control flow, functions, pattern matching (7 files)
+├── phase_02_pythonic_python/      # ✅ Mutability, scopes, generators, decorators, typing (5 files)
+├── phase_03_oop_and_modules/      # ⬜ Classes, dunder methods, dataclasses, packages
+├── phase_04_errors_files_http/    # ⬜ Exceptions, pathlib, logging, httpx
+├── phase_05_tooling_and_testing/  # ⬜ pyproject.toml, uv, ruff, pytest
+├── phase_06_async_concurrency/    # ⬜ asyncio, tasks, gather, GIL
+├── phase_07_fastapi_backend/      # ⬜ REST APIs, Pydantic, auth, dependency injection
+├── phase_08_database_production/  # ⬜ PostgreSQL, SQLAlchemy, Alembic, Redis, Docker
+├── phase_09_data_ai_foundations/  # ⬜ NumPy, Pandas, scikit-learn
+├── phase_10_llm_ai_engineering/   # ⬜ Embeddings, pgvector, RAG, tool calling
+├── phase_11_ai_architecture/      # ⬜ Gateways, SSE streaming, caching, tracing, agents
+└── projects/                      # 🧗‍♂️ P1 - P7 Progressive Ladder Projects
 ```
-
----
-
-## 🧗‍♂️ Project Ladder
-
-- [ ] **P1 — CLI Expense Tracker**: Python fundamentals, file handling, modules, exceptions.
-- [ ] **P2 — API Data Collector**: HTTP, `asyncio`, JSON parsing, retry logic, logging.
-- [ ] **P3 — FastAPI Task API**: RESTful architecture, Pydantic models, Pytest, PostgreSQL.
-- [ ] **P4 — Production Backend**: Redis caching, background worker queue, Docker, JWT auth.
-- [ ] **P5 — ML Prediction API**: Data preprocessing with NumPy/Pandas, scikit-learn model, FastAPI inference.
-- [ ] **P6 — RAG Document Chat**: Ingestion pipeline, vector database (pgvector/Qdrant), embeddings, RAG prompt.
-- [ ] **P7 — AI Knowledge Assistant**: Agent tool execution loops, streaming, background jobs, observability & tracing.
-
----
-
-## ⚡ How to Run Code
-
-Each topic file is **standalone and directly executable**:
-
-```bash
-# Create and activate virtual environment
-python -m venv .venv
-
-# Run any concept script directly:
-python phase_01_fundamentals/01_variables_and_types.py
-```
-
----
-
-## 🤖 AI LLM Instructions
-
-This repo contains an AI Skill at `.agents/skills/python-ai-learning/SKILL.md`. When interacting with any LLM in this repository, the agent will follow this skill to generate fully executable files with rich comments, JS/TS comparisons, practice questions, and phase-oriented code structure.
