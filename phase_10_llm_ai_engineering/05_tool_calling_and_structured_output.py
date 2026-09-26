@@ -1,662 +1,458 @@
-"""
-Phase 10: Tool Calling & Structured Output
-================================================================================
-1. CONCEPT & JS/TS ANALOGY:
-   - Concept: Tool calling (function calling) lets the LLM invoke external
-     functions/APIs by generating structured JSON arguments. Structured output
-     forces the LLM to respond in a specific JSON schema. Together, they turn
-     LLMs from text generators into programmable decision engines.
-   - JS/TS Equivalent: Same concept. OpenAI's function calling returns JSON
-     that you parse and dispatch. In TS you'd define schemas with Zod; in
-     Python you use Pydantic models for both tool argument schemas and
-     response validation.
-   - Key insight: The LLM doesn't execute tools — it generates a JSON payload
-     specifying which tool to call and with what arguments. YOUR code executes
-     the tool and feeds the result back to the LLM.
+r"""
+05_tool_calling_and_structured_output.py
 
-2. UNDER THE HOOD (CPython & Memory):
-   - Tool definitions are sent as part of the API request (in the `tools`
-     parameter). The LLM sees them as part of its context and generates a
-     `tool_calls` response with function name + JSON arguments.
-   - Pydantic model schemas are converted to JSON Schema format, which is
-     what the API expects. `Model.model_json_schema()` generates this.
-   - The execution loop: User msg -> LLM -> tool_call -> execute function ->
-     tool result -> LLM -> final answer. This is the foundation of AI agents.
+============================================================
+1. CONCEPT
+============================================================
 
-3. COMMON GOTCHA:
-   - Not validating tool arguments: The LLM might generate invalid JSON or
-     wrong argument types. ALWAYS validate with Pydantic before execution.
-   - Infinite tool loops: Without a max-iterations guard, the LLM might keep
-     calling tools forever. Always cap the loop (e.g., max 5 iterations).
-   - Security: The LLM decides which tools to call. Never expose destructive
-     operations (DELETE, DROP TABLE) without human approval.
+Tool Calling (Function Calling) and Structured Output transform Large Language Models
+from passive conversational interfaces into autonomous reasoning engines capable of
+taking actions, interacting with APIs, querying databases, and emitting contract-guaranteed JSON:
 
-4. INTERVIEW READINESS: VERBAL RESPONSE SCRIPT
-   - Interview Question: "How does tool/function calling work with LLMs?"
-   - How to Answer Out Loud (60-90 sec verbal script):
-     * "Tool calling lets the LLM invoke external functions. I define tools
-       as Pydantic models with name, description, and argument schema. These
-       are sent to the API in the `tools` parameter."
-     * "When the LLM determines it needs external data or actions, it returns
-       a `tool_calls` response instead of text. Each tool call has a function
-       name and JSON arguments. My code validates the arguments with Pydantic,
-       executes the function, and sends the result back as a tool message."
-     * "The LLM then generates a final natural language answer incorporating
-       the tool results. This loop can be multi-step — the LLM might call
-       multiple tools sequentially to build up context."
-     * "In production, I add guardrails: input validation, max iteration
-       limits, tool-level authorization, and logging of all tool executions
-       for audit and debugging."
-================================================================================
+1. The Tool Calling Execution Lifecycle:
+   - Step 1 (Registration): Expose Python functions to the model as JSON Schema definitions.
+   - Step 2 (Intent & Generation): User sends a prompt. The model analyzes the request, selects
+     the appropriate tool, and generates structured JSON arguments with `role="assistant"` and
+     `tool_calls=[{"id": "call_abc", "function": {"name": "...", "arguments": "{...}"}}]`.
+   - Step 3 (Execution): The client application intercepts the tool call, validates the arguments
+     against a Pydantic schema, and executes the actual Python function (e.g. database query, API ping).
+   - Step 4 (Result Injection): The application returns the function output in a message with
+     `role="tool"`, `name="fn_name"`, and `tool_call_id="call_abc"`.
+   - Step 5 (Final Synthesis): The model receives the tool result and generates a final natural
+     language response or initiates additional subsequent tool calls.
+
+2. Constrained Structured Outputs & Grammar Masking:
+   - Prompted JSON: Requesting JSON via prompt. Highly brittle; prone to conversational preamble
+     or trailing markdown backticks (````json ... ````).
+   - JSON Mode: Guarantees the output parses as valid JSON, but does NOT enforce a specific schema.
+   - Strict Structured Outputs (`json_schema` with `strict: true`):
+     * Compiles the JSON Schema into a Context-Free Grammar (CFG) or Finite State Machine (FSM).
+     * At each token step, logits that would violate the schema are masked with $-\infty$,
+       guaranteeing 100% adherence to the requested Pydantic schema.
+
+3. Automated Schema Generation with Pydantic v2:
+   - Avoid hand-writing brittle JSON schemas:
+     ```python
+     class SearchParams(BaseModel):
+         query: str = Field(..., description="Keywords to search")
+         limit: int = Field(default=5, ge=1, le=20)
+     
+     json_schema = SearchParams.model_json_schema()
+     ```
+
+
+============================================================
+2. JS / TS ANALOGY
+============================================================
+
++------------------------------+------------------------------------+------------------------------------+
+| Feature                      | Python (Pydantic / Instructor)     | JavaScript / TypeScript (Zod)      |
++------------------------------+------------------------------------+------------------------------------+
+| Schema Definition            | Pydantic v2 `BaseModel`            | `z.object({...})` (Zod)            |
+| Schema Export                | `Model.model_json_schema()`        | `zod-to-json-schema` npm package   |
+| Tool Router                  | Dict dispatch `REGISTRY[name](**)` | Object map / switch statement      |
+| Structured Output Parser     | `Model.model_validate_json()`      | `schema.parse(JSON.parse(str))`    |
+| Multi-Turn Tool Loop         | While loop appending messages      | Async while loop with message array|
+| Self-Healing Retries         | Tenacity / Pydantic retry loop     | Manual try/catch with re-prompting |
++------------------------------+------------------------------------+------------------------------------+
+
+Key JS vs Python Architecture Differences:
+1. In TypeScript, Zod validates output after string generation. If the model hallucinated an extra
+   field or malformed JSON, Zod throws a runtime exception that must be caught and re-prompted.
+2. In Python, libraries like Outlines and Instructor integrate with grammar-constrained sampling
+   at the inference engine level (vLLM / llama.cpp / OpenAI Structured Outputs), preventing invalid
+   tokens from being generated in the first place.
+
+
+============================================================
+3. UNDER THE HOOD (Grammar-Constrained Decoding & Wire State)
+============================================================
+
+1. Finite State Machine (FSM) Logit Masking:
+   - When a strict JSON schema is requested, the inference engine builds an FSM where states
+     represent valid positions in the JSON syntax.
+   - Before the softmax layer samples token $T_{i+1}$, the FSM identifies all tokens in the
+     entire vocabulary that represent valid transitions (e.g. if inside a string literal, only
+     valid characters or closing quote `"` are permitted; commas and brackets are barred).
+   - Forbidden tokens are assigned a logit of $-\infty$, making their probability $0.0$.
+   - This guarantees that parse errors, missing fields, or incorrect types are mathematically impossible!
+
+2. Wire Protocol Message Pairing Rules:
+   - Providers enforce strict validation rules on the message array:
+     * If an assistant message contains `tool_calls`, the IMMEDIATELY following message(s)
+       MUST have `role="tool"` and match every `tool_call_id` emitted.
+     * Sending a user message before resolving pending tool calls triggers an immediate 400 Bad Request.
+
+
+============================================================
+4. COMMON GOTCHAS
+============================================================
+
+1. Insecure Execution (`eval()` or Shell Injection):
+   - Passing model-generated strings directly into `eval()`, `exec()`, or raw SQL queries
+     introduces critical Remote Code Execution (RCE) vulnerabilities.
+   - FIX: Always validate arguments through strict Pydantic schemas and use parameterized DB queries.
+
+2. Unhandled Validation Errors:
+   - Assuming unconstrained LLM outputs will always parse cleanly.
+   - FIX: Implement a self-healing retry handler: catch `ValidationError`, serialize the error
+     message into a new user message, and ask the model to fix its JSON.
+
+3. Mismatched `tool_call_id`:
+   - Returning a tool response with an incorrect or missing `tool_call_id` crashes multi-turn
+     conversations.
+
+
+============================================================
+5. INTERVIEW READINESS (VERBAL SCRIPTS)
+============================================================
+
+Q1: "Explain how Tool Calling (Function Calling) works in modern LLMs from end to end."
+A1: "Tool calling follows a five-step cyclical state machine:
+     First, we declare functions using Pydantic models and export their JSON Schemas into the API request.
+     Second, the LLM processes the user prompt and determines that an external action is needed. It stops
+     generation and returns an assistant message containing `tool_calls` with a unique `id`, the function name,
+     and arguments serialized as JSON.
+     Third, our backend inspects the tool call, routes the function name through a secure registry, validates
+     the arguments with Pydantic, and executes the native Python function.
+     Fourth, we append the function result to the conversation history as a message with `role='tool'`
+     and the matching `tool_call_id`.
+     Fifth, we invoke the model again with the updated conversation history. The model consumes the tool
+     output and synthesizes a final natural language answer for the user."
+
+Q2: "What is the difference between JSON Mode and Strict Structured Outputs?"
+A2: "JSON Mode guarantees that the model will emit syntactically valid JSON (valid curly braces, quotes,
+     and keys), but it provides zero guarantees regarding schema compliance; the model can still omit
+     mandatory fields, hallucinate extra keys, or use incorrect types (like a string instead of an integer).
+     Strict Structured Outputs compiles a specific JSON Schema into a Context-Free Grammar or Finite State
+     Machine directly at the decoding layer. At every token generation step, it masks the logits of any
+     vocabulary tokens that would violate the schema with $-\infty$. This provides mathematical certainty
+     that the generated output strictly conforms to our Pydantic model contracts without runtime schema errors."
+
+Q3: "How do you implement self-healing error correction when an LLM fails structured validation?"
+A3: "When using providers that do not support grammar masking, I implement a self-healing reflection loop.
+     I attempt to parse the raw output using `Model.model_validate_json(raw_text)`. If a `ValidationError`
+     is raised, I capture Pydantic's structured error list (`err.errors()`).
+     I append the invalid response to the conversation history, followed by a new user message containing
+     the exact validation error details: 'Your previous response failed validation on fields X and Y with error Z.
+     Please output a corrected JSON object conforming strictly to the schema.'
+     The LLM inspects its mistake, corrects the missing or mis-typed fields, and succeeds on the retry attempt."
 """
 
 import sys
-if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
-    try: sys.stdout.reconfigure(encoding='utf-8')
-    except Exception: pass
-
 import json
-from dataclasses import dataclass, field
-from typing import Any, Callable
-from datetime import datetime, timezone
+import warnings
+warnings.filterwarnings("ignore")
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from pydantic import BaseModel, Field, ValidationError
+
+# Ensure UTF-8 output encoding across Windows terminals
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 
-# ══════════════════════════════════════════════════════════════════════
-# PYDANTIC-STYLE TOOL DEFINITIONS
-# In production, you'd use actual Pydantic BaseModel for these.
-# ══════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# 1. TOOL SCHEMAS & REGISTRY
+# ==============================================================================
 
-@dataclass
-class ToolParameter:
-    name: str
-    type: str  # "string", "integer", "number", "boolean", "array"
-    description: str
-    required: bool = True
-    enum: list[str] | None = None
+class CurrencyConversionArgs(BaseModel):
+    amount: float = Field(..., gt=0.0, description="Amount of money to convert")
+    from_currency: str = Field(..., min_length=3, max_length=3, description="Source 3-letter currency code (e.g. USD)")
+    to_currency: str = Field(..., min_length=3, max_length=3, description="Target 3-letter currency code (e.g. EUR)")
 
 
-@dataclass
-class ToolDefinition:
-    """
-    Defines a tool the LLM can call.
-
-    REAL CODE (OpenAI format):
-        tools = [{
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "description": "Get current weather for a city",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "city": {"type": "string", "description": "City name"},
-                        "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
-                    },
-                    "required": ["city"],
-                },
-            },
-        }]
-    """
-    name: str
-    description: str
-    parameters: list[ToolParameter]
-    handler: Callable[..., str] = field(repr=False, default=lambda **kw: "{}")
-
-    def to_openai_schema(self) -> dict:
-        """Convert to OpenAI function calling format."""
-        properties = {}
-        required = []
-        for p in self.parameters:
-            prop: dict[str, Any] = {"type": p.type, "description": p.description}
-            if p.enum:
-                prop["enum"] = p.enum
-            properties[p.name] = prop
-            if p.required:
-                required.append(p.name)
-
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": required,
-                },
-            },
-        }
+class DatabaseLookupArgs(BaseModel):
+    user_id: int = Field(..., ge=1, description="Unique primary key of the customer")
+    include_orders: bool = Field(default=False, description="Whether to include customer order history")
 
 
-@dataclass
-class ToolCall:
-    """Represents the LLM's decision to call a tool."""
-    id: str
-    function_name: str
-    arguments: dict[str, Any]
+# Concrete tool execution implementations
+def execute_currency_conversion(amount: float, from_currency: str, to_currency: str) -> Dict[str, Any]:
+    rates = {
+        ("USD", "EUR"): 0.92,
+        ("EUR", "USD"): 1.09,
+        ("USD", "GBP"): 0.79,
+    }
+    key = (from_currency.upper(), to_currency.upper())
+    rate = rates.get(key, 1.0)
+    converted = round(amount * rate, 2)
+    return {
+        "original_amount": amount,
+        "from": from_currency.upper(),
+        "to": to_currency.upper(),
+        "rate": rate,
+        "converted_amount": converted
+    }
 
 
-@dataclass
-class ToolResult:
-    """Result of executing a tool."""
-    tool_call_id: str
-    result: str  # Always stringified for the LLM
+def execute_database_lookup(user_id: int, include_orders: bool = False) -> Dict[str, Any]:
+    mock_db = {
+        101: {"name": "Grace Hopper", "status": "ACTIVE", "tier": "ENTERPRISE"},
+        102: {"name": "Alan Turing", "status": "ACTIVE", "tier": "PRO"}
+    }
+    user = mock_db.get(user_id)
+    if not user:
+        return {"error": f"User #{user_id} not found."}
+    
+    result = {"user_id": user_id, **user}
+    if include_orders:
+        result["orders"] = [f"ORD-{user_id}-1", f"ORD-{user_id}-2"]
+    return result
 
-
-# ══════════════════════════════════════════════════════════════════════
-# TOOL REGISTRY & EXECUTOR
-# ══════════════════════════════════════════════════════════════════════
 
 class ToolRegistry:
-    """Registry of available tools. Maps tool names to definitions."""
+    """Manages tool registration, JSON schema generation, and safe execution."""
 
     def __init__(self):
-        self._tools: dict[str, ToolDefinition] = {}
+        self._tools: Dict[str, Dict[str, Any]] = {}
 
-    def register(self, tool: ToolDefinition) -> None:
-        self._tools[tool.name] = tool
+    def register_tool(self, name: str, description: str, schema_cls: type[BaseModel], fn: Callable):
+        self._tools[name] = {
+            "name": name,
+            "description": description,
+            "schema": schema_cls,
+            "function": fn,
+            "openai_spec": {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": schema_cls.model_json_schema()
+                }
+            }
+        }
 
-    def get(self, name: str) -> ToolDefinition | None:
-        return self._tools.get(name)
+    def get_tool_specs(self) -> List[Dict[str, Any]]:
+        return [tool["openai_spec"] for tool in self._tools.values()]
 
-    def get_schemas(self) -> list[dict]:
-        """Get all tool schemas for the API request."""
-        return [t.to_openai_schema() for t in self._tools.values()]
+    def execute_call(self, name: str, raw_arguments_json: str) -> Dict[str, Any]:
+        if name not in self._tools:
+            return {"error": f"Unknown tool: '{name}'"}
 
-    def execute(self, tool_call: ToolCall) -> ToolResult:
-        """
-        Validate and execute a tool call.
+        tool = self._tools[name]
+        schema_cls = tool["schema"]
+        fn = tool["function"]
 
-        CRITICAL: Always validate arguments before execution.
-        The LLM might generate invalid or malicious arguments.
-        """
-        tool = self._tools.get(tool_call.function_name)
-        if not tool:
-            return ToolResult(
-                tool_call_id=tool_call.id,
-                result=json.dumps({"error": f"Unknown tool: {tool_call.function_name}"}),
-            )
-
-        # Validate required parameters
-        required_params = {p.name for p in tool.parameters if p.required}
-        provided_params = set(tool_call.arguments.keys())
-        missing = required_params - provided_params
-        if missing:
-            return ToolResult(
-                tool_call_id=tool_call.id,
-                result=json.dumps({"error": f"Missing required parameters: {missing}"}),
-            )
-
-        # Execute the handler
+        # Validate arguments through Pydantic
         try:
-            result = tool.handler(**tool_call.arguments)
-            return ToolResult(tool_call_id=tool_call.id, result=result)
-        except Exception as e:
-            return ToolResult(
-                tool_call_id=tool_call.id,
-                result=json.dumps({"error": f"Tool execution failed: {str(e)}"}),
-            )
+            validated_args = schema_cls.model_validate_json(raw_arguments_json)
+        except ValidationError as e:
+            return {"error": "Argument validation failed", "details": e.errors()}
 
-    def list_tools(self) -> list[str]:
-        return list(self._tools.keys())
+        # Execute native function
+        return fn(**validated_args.model_dump())
 
 
-# ══════════════════════════════════════════════════════════════════════
-# MOCK TOOL-CALLING LLM
-# ══════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# 2. MULTI-TURN TOOL AGENT ORCHESTRATOR
+# ==============================================================================
 
-class MockToolCallingLLM:
-    """
-    Simulates an LLM that can decide to call tools.
-
-    In production, the LLM API returns either:
-    1. A text response (finish_reason="stop")
-    2. A tool_calls response (finish_reason="tool_calls")
-    """
+class ToolCallingAgent:
+    """Orchestrates multi-turn message loops between user, model, and tools."""
 
     def __init__(self, registry: ToolRegistry):
         self.registry = registry
 
-    def chat(
-        self, messages: list[dict], tools: list[dict] | None = None
-    ) -> dict:
+    def process_turn(
+        self,
+        conversation_history: List[Dict[str, Any]],
+        model_tool_call_response: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
         """
-        Simulate a chat completion that might call tools.
-        Returns a response dict with either 'content' or 'tool_calls'.
+        Executes a single cycle:
+        1. Takes assistant tool call.
+        2. Dispatches tool execution.
+        3. Appends tool response message.
         """
-        last_msg = messages[-1].get("content", "").lower()
+        history = list(conversation_history)
 
-        # Simulate tool calling decisions based on user intent
-        if "weather" in last_msg and tools:
-            # Extract city from message
-            city = "London"  # Default
-            for word in last_msg.split():
-                if word[0].isupper() if word else False:
-                    city = word
-                    break
+        if not model_tool_call_response:
+            return history
 
-            return {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call_001",
-                        "function": {
-                            "name": "get_weather",
-                            "arguments": json.dumps({"city": city, "unit": "celsius"}),
-                        },
-                    }
-                ],
-            }
+        # Append assistant's tool call message
+        history.append(model_tool_call_response)
 
-        elif "calculate" in last_msg and tools:
-            return {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call_002",
-                        "function": {
-                            "name": "calculate",
-                            "arguments": json.dumps({"expression": "2 + 2"}),
-                        },
-                    }
-                ],
-            }
+        # Process each tool call
+        tool_calls = model_tool_call_response.get("tool_calls", [])
+        for call in tool_calls:
+            call_id = call["id"]
+            fn_name = call["function"]["name"]
+            fn_args = call["function"]["arguments"]
 
-        elif "search" in last_msg and tools:
-            query = last_msg.replace("search for", "").replace("search", "").strip()
-            return {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call_003",
-                        "function": {
-                            "name": "search_knowledge",
-                            "arguments": json.dumps({"query": query or "Python"}),
-                        },
-                    }
-                ],
-            }
+            # Execute tool safely
+            output = self.registry.execute_call(fn_name, fn_args)
 
-        else:
-            # No tool needed — direct response
-            return {
-                "role": "assistant",
-                "content": f"I'll answer directly: Your question about '{last_msg[:50]}' is interesting.",
-                "tool_calls": None,
-            }
+            # Append tool result message adhering strictly to wire protocol
+            history.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": fn_name,
+                "content": json.dumps(output)
+            })
+
+        return history
 
 
-# ══════════════════════════════════════════════════════════════════════
-# TOOL-CALLING EXECUTION LOOP (Agent Pattern)
-# ══════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# 3. SELF-HEALING STRUCTURED OUTPUT PARSER
+# ==============================================================================
 
-def run_tool_calling_loop(
-    llm: MockToolCallingLLM,
-    registry: ToolRegistry,
-    messages: list[dict],
-    max_iterations: int = 5,
-) -> str:
-    """
-    The core agent execution loop:
-    1. Send messages to LLM (with tool definitions)
-    2. If LLM returns tool_calls: execute tools, add results, loop
-    3. If LLM returns text: return the final answer
-
-    This is the foundation of AI agents (ReAct pattern).
-    """
-    tools = registry.get_schemas()
-
-    for iteration in range(max_iterations):
-        response = llm.chat(messages, tools=tools)
-
-        if response.get("tool_calls"):
-            # LLM wants to call tools
-            messages.append(response)
-
-            for tc in response["tool_calls"]:
-                tool_call = ToolCall(
-                    id=tc["id"],
-                    function_name=tc["function"]["name"],
-                    arguments=json.loads(tc["function"]["arguments"]),
-                )
-
-                print(f"    [Tool Call] {tool_call.function_name}({tool_call.arguments})")
-
-                # Execute the tool
-                result = registry.execute(tool_call)
-                print(f"    [Tool Result] {result.result}")
-
-                # Add tool result to messages
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": result.tool_call_id,
-                    "content": result.result,
-                })
-
-            # After executing all tools, we need the LLM to process results.
-            # In mock: generate a final answer incorporating tool results
-            tool_results_text = " ".join(
-                m["content"] for m in messages if m.get("role") == "tool"
-            )
-            return f"Based on the tool results: {tool_results_text}"
-
-        else:
-            # LLM returned a direct text response
-            return response.get("content", "No response")
-
-    return "Max iterations reached without a final answer."
+class UserExtractionSchema(BaseModel):
+    full_name: str = Field(..., min_length=2)
+    age: int = Field(..., ge=0, le=120)
+    skills: List[str] = Field(..., min_length=1)
 
 
-# ── Demonstration Functions ──────────────────────────────────────────────
+class SelfHealingParser:
+    """Simulates reflection loop to heal malformed or schema-invalid LLM outputs."""
 
-def demonstrate_tool_definitions():
-    """Defining tools with schemas."""
+    @staticmethod
+    def parse_with_repair(
+        raw_json_str: str,
+        repair_fn: Callable[[str, str], str]
+    ) -> Tuple[bool, Optional[UserExtractionSchema], int]:
+        attempts = 0
+        current_input = raw_json_str
+
+        while attempts < 2:
+            attempts += 1
+            try:
+                parsed = UserExtractionSchema.model_validate_json(current_input)
+                return True, parsed, attempts
+            except ValidationError as err:
+                error_summary = json.dumps(err.errors())
+                # Invoke repair function passing the bad JSON and the error
+                current_input = repair_fn(current_input, error_summary)
+
+        return False, None, attempts
+
+
+# ==============================================================================
+# 4. SELF-TESTING SUITE
+# ==============================================================================
+
+def run_tests() -> None:
+    print("\n[*] Starting automated test suite for 05_tool_calling_and_structured_output.py...")
+
+    # ------------------------------------------------------------
+    # Test 1: JSON Schema Auto-Generation via Pydantic
+    # ------------------------------------------------------------
+    print("  -> Testing Pydantic JSON Schema extraction for tool definitions...")
     registry = ToolRegistry()
+    registry.register_tool(
+        name="convert_currency",
+        description="Converts money between world currencies",
+        schema_cls=CurrencyConversionArgs,
+        fn=execute_currency_conversion
+    )
+    registry.register_tool(
+        name="lookup_user",
+        description="Fetches user details from customer database",
+        schema_cls=DatabaseLookupArgs,
+        fn=execute_database_lookup
+    )
 
-    # Define tools with handlers
-    def get_weather(city: str, unit: str = "celsius") -> str:
-        # Mock weather data
-        data = {"city": city, "temp": 22, "unit": unit, "condition": "sunny"}
+    specs = registry.get_tool_specs()
+    assert len(specs) == 2
+    conv_spec = next(s for s in specs if s["function"]["name"] == "convert_currency")
+    params = conv_spec["function"]["parameters"]
+    assert params["type"] == "object"
+    assert "amount" in params["properties"]
+    assert "from_currency" in params["properties"]
+    assert "to_currency" in params["properties"]
+
+    # ------------------------------------------------------------
+    # Test 2: Safe Tool Execution & Argument Validation
+    # ------------------------------------------------------------
+    print("  -> Testing safe tool execution and Pydantic argument validation...")
+    valid_args = json.dumps({"amount": 100.0, "from_currency": "USD", "to_currency": "EUR"})
+    res = registry.execute_call("convert_currency", valid_args)
+    assert res["converted_amount"] == 92.0
+    assert res["rate"] == 0.92
+
+    # Invalid arguments (violates gt=0 constraint)
+    invalid_args = json.dumps({"amount": -50.0, "from_currency": "USD", "to_currency": "EUR"})
+    err_res = registry.execute_call("convert_currency", invalid_args)
+    assert "error" in err_res
+    assert err_res["error"] == "Argument validation failed"
+
+    # Database lookup tool
+    db_args = json.dumps({"user_id": 101, "include_orders": True})
+    db_res = registry.execute_call("lookup_user", db_args)
+    assert db_res["name"] == "Grace Hopper"
+    assert len(db_res["orders"]) == 2
+
+    # ------------------------------------------------------------
+    # Test 3: Multi-Turn Tool Call State Machine
+    # ------------------------------------------------------------
+    print("  -> Testing multi-turn tool message sequence and wire state...")
+    agent = ToolCallingAgent(registry)
+
+    # Initial history with user query
+    history = [{"role": "user", "content": "Convert 200 USD to EUR please."}]
+
+    # Simulated LLM response requesting tool call
+    simulated_model_tool_call = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_mock_999",
+            "type": "function",
+            "function": {
+                "name": "convert_currency",
+                "arguments": json.dumps({"amount": 200.0, "from_currency": "USD", "to_currency": "EUR"})
+            }
+        }]
+    }
+
+    updated_history = agent.process_turn(history, simulated_model_tool_call)
+    assert len(updated_history) == 3
+
+    # Check assistant message
+    assert updated_history[1]["role"] == "assistant"
+    assert updated_history[1]["tool_calls"][0]["id"] == "call_mock_999"
+
+    # Check tool response message
+    tool_msg = updated_history[2]
+    assert tool_msg["role"] == "tool"
+    assert tool_msg["tool_call_id"] == "call_mock_999"
+    assert tool_msg["name"] == "convert_currency"
+    tool_data = json.loads(tool_msg["content"])
+    assert tool_data["converted_amount"] == 184.0
+
+    # ------------------------------------------------------------
+    # Test 4: Self-Healing Structured Output Repair
+    # ------------------------------------------------------------
+    print("  -> Testing self-healing reflection loop on schema validation error...")
+    # Malformed initial response (age is negative, skills is empty)
+    bad_initial_json = json.dumps({"full_name": "Ada Lovelace", "age": -1, "skills": []})
+
+    def mock_repair_agent(bad_json: str, errors: str) -> str:
+        # Repairs errors by setting valid age and skills
+        data = json.loads(bad_json)
+        data["age"] = 36
+        data["skills"] = ["Algorithms", "Mathematics", "Analytical Engine"]
         return json.dumps(data)
 
-    def calculate(expression: str) -> str:
-        # Safe calculator (in production, use a sandboxed evaluator)
-        allowed = set("0123456789+-*/.(). ")
-        if all(c in allowed for c in expression):
-            try:
-                result = eval(expression)  # DON'T use eval in production!
-                return json.dumps({"expression": expression, "result": result})
-            except Exception:
-                return json.dumps({"error": "Invalid expression"})
-        return json.dumps({"error": "Expression contains disallowed characters"})
-
-    def search_knowledge(query: str) -> str:
-        # Mock knowledge base search
-        results = [
-            {"title": f"Result about {query}", "snippet": f"Relevant info about {query}..."}
-        ]
-        return json.dumps({"results": results, "count": len(results)})
-
-    # Register tools
-    weather_tool = ToolDefinition(
-        name="get_weather",
-        description="Get the current weather for a city",
-        parameters=[
-            ToolParameter("city", "string", "The city name"),
-            ToolParameter("unit", "string", "Temperature unit", required=False, enum=["celsius", "fahrenheit"]),
-        ],
-        handler=get_weather,
+    success, parsed_obj, attempts = SelfHealingParser.parse_with_repair(
+        bad_initial_json, mock_repair_agent
     )
+    assert success is True
+    assert attempts == 2
+    assert parsed_obj.full_name == "Ada Lovelace"
+    assert parsed_obj.age == 36
+    assert len(parsed_obj.skills) == 3
 
-    calc_tool = ToolDefinition(
-        name="calculate",
-        description="Evaluate a mathematical expression",
-        parameters=[
-            ToolParameter("expression", "string", "Math expression to evaluate"),
-        ],
-        handler=calculate,
-    )
-
-    search_tool = ToolDefinition(
-        name="search_knowledge",
-        description="Search the knowledge base for information",
-        parameters=[
-            ToolParameter("query", "string", "Search query"),
-        ],
-        handler=search_knowledge,
-    )
-
-    for tool in [weather_tool, calc_tool, search_tool]:
-        registry.register(tool)
-
-    # Show schemas
-    print("  Registered tools:")
-    for schema in registry.get_schemas():
-        func = schema["function"]
-        params = list(func["parameters"]["properties"].keys())
-        print(f"    - {func['name']}: {func['description']}")
-        print(f"      Parameters: {params}")
-
-    return registry
-
-
-def demonstrate_tool_execution():
-    """Tool calling execution loop."""
-    registry = demonstrate_tool_definitions()
-    llm = MockToolCallingLLM(registry)
-
-    print("\n  === Tool Calling Loop ===")
-
-    # Query that triggers tool use
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant with access to tools."},
-        {"role": "user", "content": "What's the weather in London?"},
-    ]
-
-    print(f"  User: {messages[-1]['content']}")
-    result = run_tool_calling_loop(llm, registry, messages)
-    print(f"  Final: {result}")
-
-    return result
-
-
-def demonstrate_structured_output():
-    """Structured output — forcing LLM responses into schemas."""
-    print("  === Structured Output Patterns ===")
-    print()
-
-    # Pattern 1: JSON mode with Pydantic validation
-    print("  Pattern 1: Pydantic Response Validation")
-    print("  -----------------------------------------")
-
-    # In production with Pydantic:
-    # class SentimentResult(BaseModel):
-    #     text: str
-    #     sentiment: Literal["positive", "negative", "neutral"]
-    #     confidence: float = Field(ge=0, le=1)
-    #     keywords: list[str]
-
-    # Simulate LLM JSON response
-    mock_llm_json = json.dumps({
-        "text": "This product is amazing!",
-        "sentiment": "positive",
-        "confidence": 0.95,
-        "keywords": ["amazing", "product"],
-    })
-    parsed = json.loads(mock_llm_json)
-    print(f"    LLM JSON: {mock_llm_json}")
-    print(f"    Parsed sentiment: {parsed['sentiment']}")
-    print(f"    Confidence: {parsed['confidence']}")
-
-    # Pattern 2: OpenAI response_format
-    print("\n  Pattern 2: response_format (OpenAI API)")
-    print("  ------------------------------------------")
-    print("    client.chat.completions.create(")
-    print("        model='gpt-4o',")
-    print("        messages=[...],")
-    print("        response_format={")
-    print("            'type': 'json_schema',")
-    print("            'json_schema': {")
-    print("                'name': 'sentiment_analysis',")
-    print("                'schema': SentimentResult.model_json_schema(),")
-    print("            },")
-    print("        },")
-    print("    )")
-
-    # Pattern 3: Validation with retry
-    print("\n  Pattern 3: Validate + Retry on Parse Failure")
-    print("  -----------------------------------------------")
-
-    def parse_with_retry(llm_output: str, max_retries: int = 2) -> dict | None:
-        for attempt in range(max_retries + 1):
-            try:
-                data = json.loads(llm_output)
-                # Validate required fields
-                assert "sentiment" in data, "Missing 'sentiment'"
-                assert data["sentiment"] in ("positive", "negative", "neutral")
-                assert "confidence" in data
-                assert 0 <= data["confidence"] <= 1
-                return data
-            except (json.JSONDecodeError, AssertionError) as e:
-                print(f"    Attempt {attempt + 1}: Validation failed - {e}")
-                if attempt < max_retries:
-                    llm_output = mock_llm_json  # Re-call LLM in production
-        return None
-
-    result = parse_with_retry(mock_llm_json)
-    print(f"    Validated result: {result}")
-
-    return parsed
-
-
-def demonstrate_security():
-    """AI security considerations."""
-    print("  === AI Security Best Practices ===")
-    print()
-    print("  1. Prompt Injection Defense:")
-    print("     - Use delimiters for user input: <user_input>...</user_input>")
-    print("     - Validate LLM output before execution")
-    print("     - Never put raw user input in system prompts")
-    print()
-    print("  2. Tool Calling Security:")
-    print("     - Allowlist: Only expose safe, read-only tools by default")
-    print("     - Authorization: Check permissions before tool execution")
-    print("     - Sandboxing: Run tool code in restricted environments")
-    print("     - Audit logging: Log every tool call with arguments")
-    print()
-    print("  3. Output Validation:")
-    print("     - Schema validation: Force structured output with Pydantic")
-    print("     - Content filtering: Check for PII, harmful content")
-    print("     - Rate limiting: Cap tool calls per request")
-    print()
-    print("  4. Cost Control:")
-    print("     - Max token limits per request")
-    print("     - Budget alerts and hard caps")
-    print("     - Cheaper models for simple tasks (routing)")
-
-
-# ══════════════════════════════════════════════════════════════════════
-# SELF-TEST CHALLENGES
-# ══════════════════════════════════════════════════════════════════════
-
-def run_tests():
-    """Automated verification."""
-    print("\n[*] Running automated self-tests...")
-
-    # Test 1: Tool definition creates valid schema
-    tool = ToolDefinition(
-        name="test_tool",
-        description="A test tool",
-        parameters=[
-            ToolParameter("arg1", "string", "First arg"),
-            ToolParameter("arg2", "integer", "Second arg", required=False),
-        ],
-        handler=lambda arg1, arg2=0: json.dumps({"result": arg1}),
-    )
-    schema = tool.to_openai_schema()
-    assert schema["type"] == "function", "Schema type should be 'function'"
-    assert schema["function"]["name"] == "test_tool", "Name mismatch"
-    assert "arg1" in schema["function"]["parameters"]["properties"], "arg1 missing"
-    assert "arg1" in schema["function"]["parameters"]["required"], "arg1 should be required"
-    assert "arg2" not in schema["function"]["parameters"]["required"], "arg2 should not be required"
-
-    # Test 2: Tool registry
-    registry = ToolRegistry()
-    registry.register(tool)
-    assert "test_tool" in registry.list_tools(), "Tool should be registered"
-    assert registry.get("test_tool") is tool, "Should retrieve the tool"
-    assert registry.get("nonexistent") is None, "Should return None for unknown"
-
-    # Test 3: Tool execution
-    tc = ToolCall(id="tc1", function_name="test_tool", arguments={"arg1": "hello"})
-    result = registry.execute(tc)
-    assert result.tool_call_id == "tc1", "Tool call ID should match"
-    parsed = json.loads(result.result)
-    assert parsed["result"] == "hello", "Tool should return correct result"
-
-    # Test 4: Missing required parameter
-    tc_bad = ToolCall(id="tc2", function_name="test_tool", arguments={})
-    result_bad = registry.execute(tc_bad)
-    parsed_bad = json.loads(result_bad.result)
-    assert "error" in parsed_bad, "Should return error for missing params"
-
-    # Test 5: Unknown tool
-    tc_unknown = ToolCall(id="tc3", function_name="unknown", arguments={})
-    result_unknown = registry.execute(tc_unknown)
-    parsed_unknown = json.loads(result_unknown.result)
-    assert "error" in parsed_unknown, "Should error on unknown tool"
-
-    # Test 6: Schema generation with enum
-    enum_tool = ToolDefinition(
-        name="enum_tool",
-        description="test",
-        parameters=[
-            ToolParameter("color", "string", "A color", enum=["red", "blue", "green"]),
-        ],
-    )
-    enum_schema = enum_tool.to_openai_schema()
-    assert "enum" in enum_schema["function"]["parameters"]["properties"]["color"],         "Enum should be in schema"
-    assert enum_schema["function"]["parameters"]["properties"]["color"]["enum"] == ["red", "blue", "green"],         "Enum values should match"
-
-    # Test 7: Structured output parsing
-    valid_json = '{"sentiment": "positive", "confidence": 0.9}'
-    parsed = json.loads(valid_json)
-    assert parsed["sentiment"] == "positive", "Should parse sentiment"
-    assert 0 <= parsed["confidence"] <= 1, "Confidence should be in range"
-
-    # Test 8: Invalid JSON handling
-    invalid_json = "not json at all"
-    try:
-        json.loads(invalid_json)
-        assert False, "Should raise JSONDecodeError"
-    except json.JSONDecodeError:
-        pass  # Expected
-
-    # Test 9: Tool schemas list
-    registry2 = ToolRegistry()
-    registry2.register(tool)
-    registry2.register(enum_tool)
-    schemas = registry2.get_schemas()
-    assert len(schemas) == 2, "Should have 2 tool schemas"
-    names = {s["function"]["name"] for s in schemas}
-    assert names == {"test_tool", "enum_tool"}, "Schema names should match"
-
-    # Test 10: Tool call loop simulation
-    def mock_handler(**kwargs):
-        return json.dumps({"status": "ok", "data": kwargs})
-
-    simple_tool = ToolDefinition(
-        name="simple",
-        description="Simple tool",
-        parameters=[ToolParameter("x", "string", "input")],
-        handler=mock_handler,
-    )
-    reg = ToolRegistry()
-    reg.register(simple_tool)
-    tc = ToolCall(id="loop_test", function_name="simple", arguments={"x": "test"})
-    result = reg.execute(tc)
-    data = json.loads(result.result)
-    assert data["status"] == "ok", "Tool should execute successfully"
-    assert data["data"]["x"] == "test", "Arguments should pass through"
-
-    print("[SUCCESS] All 10 Tool Calling self-tests passed!")
+    print("[SUCCESS] All 4 Tool Calling & Structured Output tests passed cleanly!")
 
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("Phase 10: Tool Calling & Structured Output")
+    print("Phase 10 - 05: Tool Calling, Structured Outputs & JSON Schemas")
     print("=" * 70)
-    print("\n--- Tool Definitions ---")
-    demonstrate_tool_definitions()
-    print("\n--- Tool Execution Loop ---")
-    demonstrate_tool_execution()
-    print("\n--- Structured Output ---")
-    demonstrate_structured_output()
-    print("\n--- AI Security ---")
-    demonstrate_security()
-    print("-" * 70)
     run_tests()
     print("=" * 70)

@@ -1,309 +1,385 @@
-"""
-Phase 11: Semantic Caching & Rate Limiting
-================================================================================
-1. CONCEPT & JS/TS ANALOGY:
-   - Concept: Standard HTTP caches (Redis string keys) require exact character
-     matches: `cache.get("What is Python?")` fails if the user types
-     `"what is python?"` or `"Explain Python to me"`. Semantic Caching indexes
-     cached queries by embedding vector similarity. If a new prompt has
-     cosine similarity > 0.92 to a cached query, the cached response is
-     served instantly (0ms LLM latency, $0 token cost).
-   - Rate Limiting: LLM APIs enforce two distinct limits: Requests Per Minute (RPM)
-     and Tokens Per Minute (TPM). We implement a Token Bucket algorithm to protect
-     upstream quotas and provide smooth rate-limited dispatch.
-   - JS/TS Equivalent: In Node.js you use `express-rate-limit` or Redis token
-     buckets. For semantic caching, libraries like GPTCache exist in Python,
-     backed by Redis Vector Search (RediSearch) or pgvector.
+r"""
+03_semantic_caching_and_ratelimits.py
 
-2. UNDER THE HOOD (CPython & Memory):
-   - Semantic Cache: Computes query vector `q_vec`. Queries an in-memory or
-     Redis vector index for nearest neighbors. If `max(cos_sim) >= threshold`,
-     returns `cached_response`. If below threshold, invokes LLM, appends
-     `(q_vec, query, response)` to index.
-   - Token Bucket: Tracks `current_tokens` with last refill timestamp `t_last`.
-     Refill rate = `capacity / time_window`. When consuming $N$ tokens:
-     $\Delta t = t_{now} - t_{last}$, added tokens = $\Delta t 	imes refill\_rate$.
-     If available $\ge N$, deduct and proceed; else, raise or sleep.
+============================================================
+1. CONCEPT
+============================================================
 
-3. COMMON GOTCHA:
-   - Cache Threshold False Positives: If threshold is too low (e.g. 0.80),
-     questions with opposite meanings get cache hits!
-     E.g.: "Why is Python slow?" vs "Why is Python fast?" have ~0.84 cosine
-     similarity. A threshold $\ge 0.92$ is recommended in production.
-   - Caching Personalized or Stateful Contexts: Never cache prompts containing
-     session IDs, user names, or temporal queries like "What is today's date?".
+High-scale AI applications face two massive operational challenges: exorbitant API inference
+costs / latency, and strict provider rate limits. Two architectural patterns resolve these:
+Semantic Caching and Dual-Constraint Token Bucket Rate Limiting:
 
-4. 🎙️ INTERVIEW READINESS: VERBAL RESPONSE SCRIPT
-   - Interview Question: "How would you implement caching and rate limiting for
-     a production LLM backend?"
-   - How to Answer Out Loud (60-90 sec verbal script):
-     * "I implement a two-tier caching strategy: Tier 1 is an exact MD5/SHA256
-       hash cache in Redis for exact prompt matches (sub-millisecond O(1) lookup)."
-     * "Tier 2 is a Semantic Cache using Redis Vector Search or pgvector. The incoming
-       query is embedded and matched against cached queries using cosine similarity.
-       I enforce a strict similarity threshold of 0.92 or 0.95 to eliminate semantic
-       false positives. If matched, we save both LLM latency and API cost."
-     * "For rate limiting, I use a Redis-backed Distributed Token Bucket supporting
-       both RPM (Requests Per Minute) and TPM (Tokens Per Minute) quotas."
-     * "When downstream services exceed 80% TPM capacity, the rate limiter engages
-       proactive queuing with exponential backoff and jitter rather than abruptly
-       failing with 429 to the user."
-================================================================================
+1. Semantic Caching (Vector Similarity Caching):
+   - Traditional Caching Failure: Exact-match caches (`MD5(prompt)`) fail because users ask
+     the same question with minor lexical variations:
+     * "How do I reset my password?"
+     * "What are the steps to change my password?"
+     * "Forgot my login password, how to fix?"
+   - Semantic Cache Workflow:
+     1. Compute dense embedding vector of the incoming query: $v_q \in \mathbb{R}^D$.
+     2. Query the vector database for nearest cached query embedding:
+        $$\text{score} = \cos(v_q, v_{\text{cached}})$$
+     3. If $\text{score} \ge \tau$ (Similarity Threshold, typically $\tau \in [0.92, 0.96]$):
+        * Cache HIT: Return cached response immediately (latency $< 15\text{ms}$, cost = \$0.00).
+     4. If $\text{score} < \tau$:
+        * Cache MISS: Route to LLM API, store `(v_q, prompt, response)` with TTL, and return.
+
+2. Dual-Constraint Token Bucket Rate Limiting (RPM + TPM):
+   - Traditional web APIs rate limit purely on Requests-Per-Minute (RPM).
+   - In AI backends, RPM is insufficient: a single request might consume 10 tokens or 100,000 tokens.
+     A single user can exhaust the organization's entire Tokens-Per-Minute (TPM) quota!
+   - Token Bucket Mechanics:
+     * Bucket has a maximum capacity $C$ and continuously refills at rate $r$ tokens/second.
+     * Current Tokens: $T(t) = \min(C, T_{\text{last}} + \Delta t \cdot r)$.
+     * When a request arrives with estimated token cost $K$:
+       - If $T(t) \ge K$: Deduct $K$ tokens and allow the request.
+       - If $T(t) < K$: Reject immediately with HTTP 429 and `Retry-After: <seconds>`.
+
+
+============================================================
+2. JS / TS ANALOGY
+============================================================
+
++------------------------------+------------------------------------+------------------------------------+
+| Feature                      | Python (Redis / GPTCache)          | JavaScript / TypeScript (Node.js)  |
++------------------------------+------------------------------------+------------------------------------+
+| Semantic Cache               | Vector DB cosine similarity lookup | Upstash RAG / custom vector search |
+| Rate Limiter Algorithm       | Token Bucket (RPM + TPM)           | `@upstash/ratelimit` / custom Redis|
+| Atomic Concurrency           | Redis Lua scripts / atomic classes | Redis Lua scripts                  |
+| Tenant Namespacing           | `cache:{tenant_id}:{embedding}`    | `cache:${tenantId}:${id}`          |
+| Token Estimation             | `tiktoken` heuristic               | `gpt-tokenizer`                    |
++------------------------------+------------------------------------+------------------------------------+
+
+Key JS vs Python Architecture Differences:
+1. In Express or Next.js, standard rate-limiting middleware (`express-rate-limit`) tracks only IP/User
+   request counts.
+2. In Python AI microservices, the rate limiter inspects the incoming request body, computes
+   estimated prompt + max completion tokens, and evaluates atomic multi-resource rate limits (RPM + TPM)
+   before forwarding calls to the LLM gateway.
+
+
+============================================================
+3. UNDER THE HOOD (Threshold Tuning & Mathematical Guarantees)
+============================================================
+
+1. The Similarity Threshold Tradeoff Curve ($\tau$):
+   - If $\tau \ge 0.98$: Cache hit rate drops toward zero, behaving like brittle exact string matching.
+   - If $\tau \le 0.85$: False positive hits occur. Incompatible intents with similar keywords
+     (e.g., "How do I CREATE an account?" vs "How do I DELETE an account?") will match and return
+     catastrophically wrong instructions!
+   - The Sweet Spot: Empirically calibrated between $0.92 \le \tau \le 0.95$ for general customer
+     support and informational domains.
+
+2. Atomic Redis Token Bucket via Lua:
+   - Calculating elapsed time and refilling tokens in Python application memory creates severe
+     race conditions across multiple concurrent server pods.
+   - In production, the refill calculation and token deduction are bundled inside a Redis Lua script
+     executed atomically on Redis's single-threaded event loop.
+
+
+============================================================
+4. COMMON GOTCHAS
+============================================================
+
+1. Cross-Tenant Data Leaks in Shared Cache:
+   - Caching responses globally across all users without tenant isolation. If User A asks
+     "Show my account balance" and receives a response containing their balance, User B asking
+     the same question will receive User A's private data!
+   - FIX: Always partition semantic cache indexes by tenant and role: `tenant_id == X`.
+
+2. Caching Without TTL (Stale Hallucinations):
+   - Storing cached answers indefinitely. When business rules or documentation change, the cache
+     continues serving obsolete answers.
+   - FIX: Always attach an explicit TTL (e.g. 24 hours to 7 days).
+
+3. Static Non-Refilling Rate Limits:
+   - Resetting quotas abruptly at the top of the hour creates a traffic spike where all clients
+     hammer the API at minute :00.
+   - FIX: Use continuous Token Bucket refill dynamics to smooth traffic uniformly over time.
+
+
+============================================================
+5. INTERVIEW READINESS (VERBAL SCRIPTS)
+============================================================
+
+Q1: "Explain how Semantic Caching works and how you prevent false positive cache hits."
+A1: "Semantic Caching replaces brittle exact string hashing with vector similarity.
+     When a prompt arrives, we embed it using an embedding model and query our vector index using
+     cosine similarity. If the closest match exceeds our similarity threshold $\tau$ (typically 0.92 to 0.95),
+     we return the cached answer with sub-15ms latency, saving 100% of LLM generation cost.
+     To prevent false positives, we employ three guardrails:
+     First, we calibrate $\tau$ strictly above 0.92 to ensure high semantic fidelity.
+     Second, we enforce exact metadata filtering on tenant ID and user permission scope so private
+     data is never leaked across tenants.
+     Third, for sensitive domains like code execution or financial calculations, we bypass the semantic
+     cache entirely or require $\tau \ge 0.98$."
+
+Q2: "Why is traditional request-based rate limiting insufficient for LLM APIs, and how does the Token Bucket solve this?"
+A2: "Traditional rate limiters count only Requests-Per-Minute (RPM). In generative AI, requests are
+     highly asymmetrical: a short ping might consume 50 tokens, whereas a RAG query or long document
+     analysis can consume 100,000 tokens. A single user staying well below their 60 RPM limit could
+     burn 6,000,000 tokens in a minute, exhausting provider TPM quotas and taking down the entire service.
+     We solve this by implementing a dual-constraint Token Bucket algorithm in Redis. The bucket tracks
+     both RPM and TPM with independent capacities and continuous refill rates. When a request arrives,
+     we estimate its token footprint (input tokens + requested max output) and deduct that amount atomically.
+     If the bucket lacks sufficient tokens, the request is rejected with HTTP 429 before hitting the LLM."
+
+Q3: "How do you implement atomic Token Bucket rate limiting in a distributed architecture?"
+A3: "In a multi-pod cluster, keeping token counters in Python process memory causes race conditions.
+     I implement the Token Bucket using an atomic Lua script executed inside Redis.
+     The Lua script takes the tenant key, capacity, refill rate, requested token cost, and current timestamp.
+     It computes the time delta since the last refill, adds newly accumulated tokens up to the maximum capacity,
+     checks if available tokens satisfy the request cost, decrements the balance, and records the timestamp.
+     Because Redis executes Lua scripts atomically on its single thread, this guarantees zero race conditions
+     and sub-millisecond evaluation across hundreds of concurrent API pods."
 """
 
 import sys
-if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
-    try: sys.stdout.reconfigure(encoding='utf-8')
-    except Exception: pass
-
 import time
+import math
+import warnings
+warnings.filterwarnings("ignore")
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
-from dataclasses import dataclass, field
-from typing import Any
+
+# Ensure UTF-8 output encoding across Windows terminals
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 
-# ── Fast Semantic Mock Embedder ──────────────────────────────────────────────
-
-def pseudo_embed(text: str, dims: int = 32) -> np.ndarray:
-    """Deterministic normalized embedding for semantic cache tests."""
-    np.random.seed(hash(text.strip().lower()) % (2**31))
-    vec = np.random.randn(dims).astype(np.float32)
-
-    # Nudge semantic topical cluster weights
-    lower = text.lower()
-    if "python" in lower:
-        vec[0:4] += np.array([2.5, 1.2, 0.8, 0.4], dtype=np.float32)
-    if "rate" in lower or "limit" in lower:
-        vec[4:8] += np.array([2.5, 1.2, 0.8, 0.4], dtype=np.float32)
-    if "fastapi" in lower or "async" in lower:
-        vec[8:12] += np.array([2.5, 1.2, 0.8, 0.4], dtype=np.float32)
-
-    norm = np.linalg.norm(vec)
-    return vec / norm if norm > 0 else vec
-
-
-def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
-
-
-# ── Semantic Cache Implementation ────────────────────────────────────────────
+# ==============================================================================
+# 1. SEMANTIC VECTOR CACHE ENGINE
+# ==============================================================================
 
 @dataclass
 class CacheEntry:
-    query: str
+    query_text: str
     embedding: np.ndarray
-    response: str
-    created_at: float = field(default_factory=time.time)
-    hits: int = 0
+    response_text: str
+    tenant_id: str
+    created_at: float
+    ttl_seconds: float
 
 
 class SemanticCache:
     """
-    Semantic Cache matching incoming prompts against stored vectors.
+    In-memory semantic cache using cosine similarity:
+    - Enforces similarity threshold tau to prevent false positive matches.
+    - Strictly namespaces by tenant_id to prevent cross-tenant data leaks.
+    - Honors Time-To-Live (TTL) expiration.
     """
 
-    def __init__(self, similarity_threshold: float = 0.90):
-        self.similarity_threshold = similarity_threshold
-        self.entries: list[CacheEntry] = []
-        self.exact_cache: dict[str, str] = {}  # Tier 1: exact string match
-        self.cache_hits = 0
-        self.cache_misses = 0
+    def __init__(self, similarity_threshold: float = 0.92, default_ttl_seconds: float = 3600):
+        self.threshold = similarity_threshold
+        self.default_ttl = default_ttl_seconds
+        self.entries: List[CacheEntry] = []
+        self.hit_count = 0
+        self.miss_count = 0
 
-    def get(self, query: str) -> tuple[str | None, float]:
-        """
-        Check Tier 1 (exact match), then Tier 2 (semantic similarity).
-        Returns (response, similarity_score).
-        """
-        cleaned = query.strip().lower()
+    def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
+        norm_a = np.linalg.norm(a)
+        norm_b = np.linalg.norm(b)
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return float(np.dot(a, b) / (norm_a * norm_b))
 
-        # Tier 1: Exact string hit
-        if cleaned in self.exact_cache:
-            self.cache_hits += 1
-            return self.exact_cache[cleaned], 1.0
-
-        if not self.entries:
-            self.cache_misses += 1
-            return None, 0.0
-
-        # Tier 2: Vector search over cached embeddings
-        query_vec = pseudo_embed(query)
-        best_score = -1.0
-        best_entry: CacheEntry | None = None
-
-        for entry in self.entries:
-            sim = cosine_sim(query_vec, entry.embedding)
-            if sim > best_score:
-                best_score = sim
-                best_entry = entry
-
-        if best_entry and best_score >= self.similarity_threshold:
-            self.cache_hits += 1
-            best_entry.hits += 1
-            return best_entry.response, best_score
-
-        self.cache_misses += 1
-        return None, best_score
-
-    def set(self, query: str, response: str):
-        """Stores query, embedding, and response in cache."""
-        cleaned = query.strip().lower()
-        self.exact_cache[cleaned] = response
-        self.entries.append(CacheEntry(
-            query=query,
-            embedding=pseudo_embed(query),
-            response=response,
-        ))
-
-
-# ── Token Bucket Rate Limiter ────────────────────────────────────────────────
-
-class TokenBucketRateLimiter:
-    """
-    Token Bucket rate limiter for managing RPM and TPM budgets.
-    """
-
-    def __init__(self, capacity: float, refill_rate_per_sec: float):
-        self.capacity = float(capacity)
-        self.refill_rate = float(refill_rate_per_sec)
-        self.tokens = float(capacity)
-        self.last_refill = time.time()
-
-    def _refill(self):
+    def get(self, query_vector: np.ndarray, tenant_id: str) -> Optional[Tuple[str, float]]:
         now = time.time()
-        elapsed = now - self.last_refill
-        self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
-        self.last_refill = now
+        best_match: Optional[CacheEntry] = None
+        best_score = -1.0
 
-    def acquire(self, tokens: float = 1.0) -> bool:
-        """Attempts to acquire tokens immediately without blocking."""
+        # Scan cached entries for matching tenant
+        for entry in self.entries:
+            # Check tenant isolation
+            if entry.tenant_id != tenant_id:
+                continue
+
+            # Check TTL expiry
+            if now - entry.created_at > entry.ttl_seconds:
+                continue
+
+            score = self._cosine_similarity(query_vector, entry.embedding)
+            if score > best_score:
+                best_score = score
+                best_match = entry
+
+        # Check if best score satisfies semantic threshold
+        if best_match and best_score >= self.threshold:
+            self.hit_count += 1
+            return best_match.response_text, best_score
+
+        self.miss_count += 1
+        return None
+
+    def set(
+        self,
+        query_text: str,
+        query_vector: np.ndarray,
+        response_text: str,
+        tenant_id: str,
+        ttl_seconds: Optional[float] = None
+    ) -> None:
+        entry = CacheEntry(
+            query_text=query_text,
+            embedding=query_vector,
+            response_text=response_text,
+            tenant_id=tenant_id,
+            created_at=time.time(),
+            ttl_seconds=ttl_seconds or self.default_ttl
+        )
+        self.entries.append(entry)
+
+
+# ==============================================================================
+# 2. DUAL-CONSTRAINT TOKEN BUCKET RATE LIMITER (RPM + TPM)
+# ==============================================================================
+
+class TokenBucketLimiter:
+    """
+    Implements continuous refill Token Bucket algorithm tracking:
+    1. Requests-Per-Minute (RPM)
+    2. Tokens-Per-Minute (TPM)
+    """
+
+    def __init__(
+        self,
+        max_requests: float = 60.0,
+        requests_refill_per_sec: float = 1.0,
+        max_tokens: float = 10_000.0,
+        tokens_refill_per_sec: float = 166.67  # 10,000 tokens / 60s
+    ):
+        self.max_requests = max_requests
+        self.req_refill_rate = requests_refill_per_sec
+        self.current_requests = max_requests
+
+        self.max_tokens = max_tokens
+        self.token_refill_rate = tokens_refill_per_sec
+        self.current_tokens = max_tokens
+
+        self.last_update = time.time()
+
+    def _refill(self) -> None:
+        now = time.time()
+        elapsed = now - self.last_update
+        self.last_update = now
+
+        # Refill request tokens
+        self.current_requests = min(self.max_requests, self.current_requests + (elapsed * self.req_refill_rate))
+        # Refill token budget
+        self.current_tokens = min(self.max_tokens, self.current_tokens + (elapsed * self.token_refill_rate))
+
+    def try_acquire(self, estimated_tokens: int = 100) -> Tuple[bool, str]:
         self._refill()
-        if self.tokens >= tokens:
-            self.tokens -= tokens
-            return True
-        return False
 
-    def wait_and_acquire(self, tokens: float = 1.0, timeout: float = 2.0) -> bool:
-        """Blocks until tokens become available or timeout expires."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if self.acquire(tokens):
-                return True
-            time.sleep(0.01)
-        return False
+        # 1. Check RPM constraint
+        if self.current_requests < 1.0:
+            return False, "Rate limit exceeded: RPM quota exhausted."
+
+        # 2. Check TPM constraint
+        if self.current_tokens < estimated_tokens:
+            return False, f"Rate limit exceeded: TPM quota exhausted (requires {estimated_tokens} tokens)."
+
+        # Deduct from both buckets
+        self.current_requests -= 1.0
+        self.current_tokens -= estimated_tokens
+        return True, "Request permitted."
 
 
-# ── Demonstration Functions ──────────────────────────────────────────────────
+# ==============================================================================
+# 3. SELF-TESTING SUITE
+# ==============================================================================
 
-def demonstrate_semantic_caching():
-    """Demonstrates cache hit on semantically identical prompts."""
-    print("  --- Demonstration 1: Semantic Caching ---")
+def run_tests() -> None:
+    print("\n[*] Starting automated test suite for 03_semantic_caching_and_ratelimits.py...")
+
+    # ------------------------------------------------------------
+    # Test 1: Semantic Caching Hit on Paraphrased Queries
+    # ------------------------------------------------------------
+    print("  -> Testing semantic cache hit on semantically equivalent paraphrasing...")
     cache = SemanticCache(similarity_threshold=0.90)
 
-    # 1. First user queries — Cache Miss
-    q1 = "How do I install python packages using uv?"
-    resp1 = "Run 'uv pip install <package>' or 'uv add <package>'."
-    hit, score = cache.get(q1)
-    print(f"    Q1: '{q1}' -> Hit: {hit is not None} (Sim: {score:.2f})")
-    cache.set(q1, resp1)
+    # Base query: "How do I reset my password?"
+    vec_base = np.array([0.98, 0.12, 0.05], dtype=np.float32)
+    cache.set(
+        query_text="How do I reset my password?",
+        query_vector=vec_base,
+        response_text="Go to Settings -> Security -> Reset Password.",
+        tenant_id="tenant_alpha"
+    )
 
-    # 2. Exact match — Tier 1 Hit
-    hit, score = cache.get(q1)
-    print(f"    Q1 (exact): -> Hit: {hit is not None} (Sim: {score:.2f}) -> '{hit}'")
+    # Paraphrased query: "Steps to change my account password" (high cosine similarity: ~0.99)
+    vec_paraphrase = np.array([0.97, 0.14, 0.04], dtype=np.float32)
+    cached_res, score = cache.get(vec_paraphrase, tenant_id="tenant_alpha")
 
-    # 3. Semantically identical prompt — Tier 2 Hit!
-    q2 = "how do i install python packages using uv?"
-    hit2, score2 = cache.get(q2)
-    print(f"    Q2 (lowercase): -> Hit: {hit2 is not None} (Sim: {score2:.2f}) -> '{hit2}'")
+    assert cached_res is not None, "Semantic cache failed to hit on paraphrase"
+    assert cached_res == "Go to Settings -> Security -> Reset Password."
+    assert score >= 0.90
+    assert cache.hit_count == 1
 
-    # 4. Unrelated prompt — Cache Miss
-    q3 = "What is the capital of France?"
-    hit3, score3 = cache.get(q3)
-    print(f"    Q3 (unrelated): -> Hit: {hit3 is not None} (Sim: {score3:.2f})")
+    # ------------------------------------------------------------
+    # Test 2: Semantic Cache Miss on Distinct Queries
+    # ------------------------------------------------------------
+    print("  -> Testing semantic cache miss when query is semantically divergent...")
+    # Divergent query: "How do I cancel my billing subscription?"
+    vec_unrelated = np.array([0.05, 0.95, 0.20], dtype=np.float32)
+    miss_res = cache.get(vec_unrelated, tenant_id="tenant_alpha")
 
+    assert miss_res is None, "Semantic cache erroneously matched unrelated query"
+    assert cache.miss_count == 1
 
-def demonstrate_rate_limiter():
-    """Demonstrates token bucket depletion and rejection."""
-    print("\n  --- Demonstration 2: Token Bucket Rate Limiting ---")
-    # Capacity: 5 tokens, Refill: 2 tokens per second
-    limiter = TokenBucketRateLimiter(capacity=5, refill_rate_per_sec=2)
+    # ------------------------------------------------------------
+    # Test 3: Multi-Tenant Cache Isolation (No Cross-Tenant Leaks)
+    # ------------------------------------------------------------
+    print("  -> Testing tenant isolation (preventing cross-tenant data leaks)...")
+    # Same vector queried by different tenant -> MUST RESULT IN CACHE MISS
+    tenant_beta_res = cache.get(vec_paraphrase, tenant_id="tenant_beta")
+    assert tenant_beta_res is None, "Security violation: Cross-tenant cache contamination detected"
 
-    print("    Bursting 5 rapid requests:")
-    for i in range(1, 7):
-        success = limiter.acquire(1)
-        status = "ACCEPTED" if success else "REJECTED (HTTP 429)"
-        print(f"      Request #{i}: {status} (Tokens remaining: {limiter.tokens:.1f})")
+    # ------------------------------------------------------------
+    # Test 4: Dual-Constraint Token Bucket Rate Limiting (RPM + TPM)
+    # ------------------------------------------------------------
+    print("  -> Testing Dual-Constraint Token Bucket rate limiter (RPM + TPM)...")
+    limiter = TokenBucketLimiter(
+        max_requests=3.0,
+        requests_refill_per_sec=0.5,
+        max_tokens=500.0,
+        tokens_refill_per_sec=50.0
+    )
 
+    # 1. Normal requests within quota
+    ok1, _ = limiter.try_acquire(estimated_tokens=100)
+    assert ok1 is True
+    ok2, _ = limiter.try_acquire(estimated_tokens=150)
+    assert ok2 is True
 
-# ══════════════════════════════════════════════════════════════════════
-# SELF-TEST CHALLENGES
-# ══════════════════════════════════════════════════════════════════════
+    # 2. Large request that exceeds remaining TPM (requires 300, only 250 left)
+    ok3, msg3 = limiter.try_acquire(estimated_tokens=300)
+    assert ok3 is False
+    assert "TPM quota exhausted" in msg3
 
-def run_tests():
-    """Automated verification for Phase 11 File 3."""
-    print("\n[*] Running automated self-tests...")
+    # 3. Exhausting RPM
+    ok4, _ = limiter.try_acquire(estimated_tokens=50)
+    assert ok4 is True  # 3rd request succeeds, exhausts RPM to ~0
+    ok5, msg5 = limiter.try_acquire(estimated_tokens=10)
+    assert ok5 is False
+    assert "RPM quota exhausted" in msg5
 
-    # Test 1: Exact match hits Tier 1
-    cache = SemanticCache(similarity_threshold=0.85)
-    cache.set("what is python", "Python is a language")
-    resp, score = cache.get("what is python")
-    assert resp == "Python is a language"
-    assert score == 1.0
+    # 4. Refill over time
+    time.sleep(0.1)
+    limiter._refill()
+    assert limiter.current_tokens > 0
 
-    # Test 2: Case insensitivity in Tier 1
-    resp2, score2 = cache.get("WHAT IS PYTHON")
-    assert resp2 == "Python is a language"
-
-    # Test 3: Cache miss on empty cache
-    empty = SemanticCache()
-    r_empty, _ = empty.get("unknown")
-    assert r_empty is None
-    assert empty.cache_misses == 1
-
-    # Test 4: Semantic similarity computation
-    v1 = pseudo_embed("python coding")
-    v2 = pseudo_embed("python coding")
-    assert abs(cosine_sim(v1, v2) - 1.0) < 1e-4
-
-    # Test 5: Cache stats tracking
-    assert cache.cache_hits == 2
-
-    # Test 6: Rate limiter full capacity burst
-    tb = TokenBucketRateLimiter(capacity=3, refill_rate_per_sec=10)
-    assert tb.acquire(1) is True
-    assert tb.acquire(1) is True
-    assert tb.acquire(1) is True
-    assert tb.acquire(1) is False  # Exhausted
-
-    # Test 7: Rate limiter refill
-    time.sleep(0.15)  # 0.15s * 10 tokens/s = 1.5 tokens refilled
-    assert tb.acquire(1) is True
-
-    # Test 8: Rate limiter capacity clamp
-    tb_overflow = TokenBucketRateLimiter(capacity=2, refill_rate_per_sec=100)
-    time.sleep(0.05)
-    tb_overflow._refill()
-    assert tb_overflow.tokens <= 2.0, "Tokens must not exceed capacity"
-
-    # Test 9: Wait and acquire succeeds within timeout
-    tb_wait = TokenBucketRateLimiter(capacity=1, refill_rate_per_sec=20)
-    tb_wait.acquire(1)
-    acquired = tb_wait.wait_and_acquire(tokens=1, timeout=0.2)
-    assert acquired is True
-
-    # Test 10: Wait and acquire times out if deficit too large
-    tb_starve = TokenBucketRateLimiter(capacity=0, refill_rate_per_sec=0.1)
-    timeout_result = tb_starve.wait_and_acquire(tokens=10, timeout=0.05)
-    assert timeout_result is False
-
-    print("[SUCCESS] All 10 Semantic Caching & Rate Limiting self-tests passed!")
+    print("[SUCCESS] All 4 Semantic Caching & Rate Limiting tests passed cleanly!")
 
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("Phase 11: Semantic Caching & Rate Limiting")
+    print("Phase 11 - 03: Semantic Caching & Dual-Constraint Rate Limiting")
     print("=" * 70)
-    demonstrate_semantic_caching()
-    demonstrate_rate_limiter()
-    print("-" * 70)
     run_tests()
     print("=" * 70)

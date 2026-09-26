@@ -1,514 +1,375 @@
-"""
-Phase 10: Vector Databases — pgvector & In-Memory Vector Store
-================================================================================
-1. CONCEPT & JS/TS ANALOGY:
-   - Concept: Vector databases store embeddings and enable efficient similarity
-     search (nearest neighbor queries). Instead of SQL WHERE clauses, you query
-     by "find the 10 vectors most similar to this query vector."
-   - JS/TS Equivalent: No direct equivalent. In JS you might use Pinecone's
-     REST API. In Python, you can use pgvector (PostgreSQL extension),
-     Qdrant, ChromaDB, Weaviate, or Milvus. pgvector is popular because it
-     runs inside your existing PostgreSQL — no new infrastructure.
-   - Key concepts: ANN (Approximate Nearest Neighbor) search, HNSW index
-     (graph-based, fast recall), IVFFlat index (cluster-based, less memory),
-     metadata filtering (combine vector search with SQL-like filters).
+r"""
+03_vector_databases_pgvector.py
 
-2. UNDER THE HOOD (CPython & Memory):
-   - Brute-force search: compute similarity against ALL vectors. O(N*D) where
-     N = number of vectors, D = dimensions. Fine for <10K vectors.
-   - HNSW (Hierarchical Navigable Small World): Builds a layered graph where
-     each node connects to its nearest neighbors. Search traverses the graph
-     from top layer down, narrowing candidates. O(log N) search time.
-   - IVFFlat: Clusters vectors using k-means, then searches only the nearest
-     clusters. Faster than brute-force but requires periodic re-clustering.
-   - pgvector SQL: `SELECT * FROM items ORDER BY embedding <=> query_vec LIMIT 10`
-     The `<=>` operator is cosine distance, `<->` is L2 distance.
+============================================================
+1. CONCEPT
+============================================================
 
-3. COMMON GOTCHA:
-   - Not creating an index: pgvector without an HNSW or IVFFlat index falls
-     back to brute-force sequential scan. Fine for 1K vectors, catastrophic
-     for 1M. Always create an index for production.
-   - Metadata filtering AFTER vector search: If you filter after retrieving
-     top-K, you might get fewer than K results. Pre-filter when possible,
-     or over-fetch and then filter.
+As vector datasets scale beyond 100,000 embeddings, exact brute-force k-Nearest Neighbor
+(k-NN) with $O(N \cdot D)$ complexity becomes computationally prohibitive. Vector databases
+and PostgreSQL's `pgvector` extension provide Approximate Nearest Neighbor (ANN) search,
+trading $< 1-2\%$ recall for sub-10ms logarithmic $O(\log N)$ retrieval:
 
-4. INTERVIEW READINESS: VERBAL RESPONSE SCRIPT
-   - Interview Question: "How would you implement semantic search in a
-     production system?"
-   - How to Answer Out Loud (60-90 sec verbal script):
-     * "I'd use pgvector as the vector store since we're already on Postgres.
-       I'd add the vector extension, create a column with type `vector(1536)`,
-       and build an HNSW index for fast approximate search."
-     * "At ingestion: I chunk documents, embed each chunk with the embedding
-       API, and store the vector alongside metadata (source, page, timestamp)."
-     * "At query time: I embed the user query, run a vector similarity query
-       with `ORDER BY embedding <=> query_vec LIMIT 10`, optionally adding
-       WHERE clauses for metadata filtering."
-     * "For hybrid search, I'd combine vector similarity with BM25 text
-       search using Reciprocal Rank Fusion to get the best of both semantic
-       and keyword matching."
-================================================================================
+1. PostgreSQL `pgvector` Architecture:
+   - Native `vector(D)` data type embedded directly into relational PostgreSQL tables.
+   - Unifies ACID transactional relational data (users, permissions, timestamps, foreign keys)
+     with vector embeddings in a single database, eliminating complex ETL synchronization.
+   - Distance Operators:
+     * `<->`: Euclidean / L2 Distance ($\|u - v\|_2$).
+     * `<#>`: Negative Inner Product (used for maximum inner product search).
+     * `<=>`: Cosine Distance ($1 - \cos(u, v)$).
+
+2. Production Indexing Strategies (HNSW vs IVFFlat):
+   - HNSW (Hierarchical Navigable Small World):
+     * Constructs a multi-layer graph where upper layers contain sparse long-range highway edges
+       and lower layers contain dense local connections.
+     * Hyperparameters:
+       - `m`: Maximum number of bidirectional connections per element per layer (e.g. 16 to 64).
+       - `ef_construction`: Size of dynamic candidate list during graph building (e.g. 64 to 200).
+       - `ef_search`: Candidate list size during queries (higher `ef_search` = higher recall at cost of latency).
+     * Pros: Highest recall ($> 98\%$), exceptional query latency ($< 5\text{ms}$), dynamic updates.
+     * Cons: High RAM usage and longer index build times.
+   - IVFFlat (Inverted File Flat):
+     * Partitions the vector space into $K$ Voronoi cells using k-means clustering.
+     * Hyperparameters:
+       - `lists`: Number of cluster centroids (typically $\sqrt{N}$ or $N / 1000$).
+       - `probes`: Number of neighboring centroids inspected during query (e.g. 1 to 10).
+     * Pros: Minimal RAM overhead, fast build times.
+     * Cons: Lower recall on edge cases; requires re-indexing when data distribution shifts.
+
+3. Hybrid Search & Reciprocal Rank Fusion (RRF):
+   - Dense vector search excels at conceptual semantic similarity, but struggles with exact
+     keyword matching (part numbers, specific product codes, exact names).
+   - Hybrid Search combines dense vector retrieval with sparse PostgreSQL full-text search (`tsvector` / BM25).
+   - Reciprocal Rank Fusion (RRF) merges disparate ranking lists without score calibration:
+     $$\text{RRF}(d) = \sum_{m \in M} \frac{1}{k + \text{rank}_m(d)}$$
+     where $k$ is a constant (typically 60) and $\text{rank}_m(d)$ is the 1-based rank in method $m$.
+
+
+============================================================
+2. JS / TS ANALOGY
+============================================================
+
++------------------------------+------------------------------------+------------------------------------+
+| Feature                      | Python (pgvector / SQLAlchemy)     | JavaScript / TypeScript (Node.js)  |
++------------------------------+------------------------------------+------------------------------------+
+| Vector Storage               | Native PostgreSQL `vector(1536)`   | Standalone Pinecone / Weaviate DB  |
+| Distance Queries             | SQL `ORDER BY embedding <=> :query`| SDK client `.query({ vector })`    |
+| Metadata Pre-Filtering       | Native SQL `WHERE tenant_id = 5`   | Proprietary metadata filter DSL    |
+| Index Types                  | HNSW / IVFFlat via DDL             | Cloud-managed proprietary indexes  |
+| Hybrid Search                | SQL combining vector + `tsvector`  | Dual API queries + manual fusion   |
+| Transactions                 | ACID transactions with rollback    | Eventual consistency / 2-phase API |
++------------------------------+------------------------------------+------------------------------------+
+
+Key JS vs Python Architecture Differences:
+1. In the JavaScript/TypeScript ecosystem, developers frequently adopt SaaS vector databases
+   (Pinecone, Qdrant Cloud) due to easy HTTP SDKs, which introduces dual-database syncing challenges
+   and eventual consistency issues.
+2. In Python backend architectures, `pgvector` allows keeping vectors inside the primary PostgreSQL
+   database. A single atomic SQL query can enforce tenant isolation (`tenant_id = :tid`), apply
+   business filters (`is_archived = false`), and execute HNSW vector similarity search in a single pass.
+
+
+============================================================
+3. UNDER THE HOOD (HNSW Graph Traversal & Voronoi Cells)
+============================================================
+
+1. HNSW Multi-Layer Skip-List Graph Mechanics:
+   - Inspired by Skip Lists, HNSW builds layers $L_{\max}$ down to $L_0$.
+   - Search begins at entry point in the highest layer $L_{\max}$.
+   - The query performs greedy search: moving to neighboring nodes that are closer to the query
+     until a local minimum is reached.
+   - It drops down to the next lower layer and repeats greedy search, narrowing down the neighborhood
+     until reaching layer $L_0$, where it executes detailed local exploration with candidate list size `ef_search`.
+   - Result: $O(\log N)$ logarithmic search complexity instead of $O(N)$ linear scans.
+
+2. IVFFlat Centroid Inverted Lists:
+   - IVFFlat uses k-means to compute $C$ cluster centroids across the vector space.
+   - Every vector in the table is assigned to its closest centroid's inverted posting list.
+   - At query time: the query vector finds the closest `probes` centroids and scans ONLY the
+     vectors stored in those specific inverted lists, skipping $> 95\%$ of the table rows.
+
+
+============================================================
+4. COMMON GOTCHAS
+============================================================
+
+1. Building IVFFlat on an Empty Table:
+   - IVFFlat trains k-means centroids during `CREATE INDEX`. If executed on an empty table or
+     before data is loaded, all centroids collapse to the origin, permanently degrading recall!
+   - FIX: Always load initial production data BEFORE building an IVFFlat index, or use HNSW
+     which builds incrementally as rows are inserted.
+
+2. Forgetting `SET hnsw.ef_search`:
+   - The default `hnsw.ef_search` parameter in pgvector defaults to 40. For complex high-dimensional
+     queries, this may result in $< 90\%$ recall.
+   - FIX: Tune `SET hnsw.ef_search = 100` in the database session for critical retrieval endpoints.
+
+3. Neglecting Relational Partitioning / Pre-filtering:
+   - In multi-tenant SaaS applications, running HNSW across all tenants and filtering `WHERE tenant_id = X`
+     afterwards can cause index scan aborts if the tenant has few rows.
+   - FIX: Partition tables by `tenant_id` or use composite indexes/iterative index scans.
+
+
+============================================================
+5. INTERVIEW READINESS (VERBAL SCRIPTS)
+============================================================
+
+Q1: "Compare HNSW and IVFFlat indexes in pgvector. When would you choose each for an AI application?"
+A1: "HNSW builds a hierarchical navigable small-world graph. It delivers superior query latency (sub-5ms)
+     and excellent recall (typically $> 98\%$), and it supports incremental real-time inserts without
+     degradation. However, it consumes significant RAM because it must store graph edge lists in memory,
+     and index build times are longer.
+     IVFFlat clusters the vector space into Voronoi cells using k-means. It uses a fraction of the RAM
+     and builds rapidly, but it has lower recall on boundaries and requires periodic re-indexing as
+     data distribution changes. Furthermore, creating an IVFFlat index on an empty table produces useless
+     centroids.
+     In production, I default to HNSW for mission-critical RAG and semantic search where high recall and
+     low latency are paramount, reserving IVFFlat for memory-constrained environments or append-only
+     batch datasets."
+
+Q2: "What is Hybrid Search, and how does Reciprocal Rank Fusion (RRF) work in PostgreSQL?"
+A2: "Hybrid Search combines dense vector similarity search with sparse keyword search (BM25 or PostgreSQL
+     `tsvector`). Dense vectors capture semantic conceptual meaning and synonyms, but fail on exact alphanumeric
+     tokens like model SKUs or error codes. Sparse keyword search captures exact tokens perfectly.
+     To combine their results without normalizing mismatched score distributions (cosine distance vs BM25 rank),
+     we use Reciprocal Rank Fusion. RRF assigns a score based purely on reciprocal rank positions:
+     $\text{score}(d) = \sum 1 / (60 + \text{rank}(d))$. Documents that rank highly across both semantic
+     and keyword passes rise to the top, providing robust search quality across all query types."
+
+Q3: "Why choose `pgvector` inside PostgreSQL over a dedicated vector database like Pinecone or Milvus?"
+A3: "Choosing `pgvector` keeps vectors co-located with primary application data inside PostgreSQL.
+     This provides three massive engineering advantages:
+     First, ACID Consistency: Inserting a document and its embedding happens in a single atomic transaction;
+     there is no eventual consistency lag or dual-write failure where relational DB succeeds but vector DB fails.
+     Second, Unified Querying: We can filter on complex relational permissions, tenant IDs, foreign keys,
+     and timestamps in the same SQL query with query planner optimization.
+     Third, Operational Simplicity: We reuse existing PostgreSQL backup, replica, monitoring, and compliance
+     infrastructure without operating and paying for an additional distributed database cluster."
 """
 
 import sys
-if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
-    try: sys.stdout.reconfigure(encoding='utf-8')
-    except Exception: pass
+import math
+import warnings
+warnings.filterwarnings("ignore")
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from dataclasses import dataclass, field
-from typing import Any
-import json
-import time
+
+# Ensure UTF-8 output encoding across Windows terminals
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 
-# ══════════════════════════════════════════════════════════════════════
-# IN-MEMORY VECTOR STORE — Teaches the vector DB interface pattern
-# Production: Replace with pgvector, Qdrant, ChromaDB, etc.
-# ══════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# 1. SQL SCHEMA SPECIFICATION FOR PGVECTOR
+# ==============================================================================
 
-@dataclass
-class Document:
-    """A document with its embedding and metadata."""
-    id: str
-    text: str
-    embedding: np.ndarray
-    metadata: dict[str, Any] = field(default_factory=dict)
+PGVECTOR_SQL_SCHEMA = """-- Enable the pgvector extension
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Document chunks table with embeddings and relational metadata
+CREATE TABLE document_chunks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id INT NOT NULL,
+    document_id UUID NOT NULL,
+    chunk_index INT NOT NULL,
+    content TEXT NOT NULL,
+    tsv_content tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
+    embedding vector(1536) NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 1. HNSW Index for ultra-fast semantic similarity search (Cosine Distance)
+CREATE INDEX idx_chunks_embedding_hnsw 
+ON document_chunks 
+USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+
+-- 2. GIN Index for sparse keyword Full-Text Search (BM25)
+CREATE INDEX idx_chunks_tsv ON document_chunks USING gin (tsv_content);
+
+-- 3. Composite B-Tree for relational tenant isolation
+CREATE INDEX idx_chunks_tenant_doc ON document_chunks (tenant_id, document_id);
+"""
 
 
-@dataclass
-class SearchResult:
-    """A search result with score."""
-    document: Document
-    score: float  # cosine similarity
+# ==============================================================================
+# 2. IVFFLAT CLUSTERING & VORONOI PARTITIONING SIMULATOR
+# ==============================================================================
 
-
-class InMemoryVectorStore:
+class IVFFlatSimulator:
     """
-    In-memory vector store implementing the core vector DB interface.
-
-    This mirrors the interface of production vector databases:
-    - pgvector: SQL-based, runs inside PostgreSQL
-    - Qdrant: gRPC/REST API, built in Rust, great for production
-    - ChromaDB: Python-native, good for prototyping
-    - Weaviate: GraphQL API, supports hybrid search
-
-    REAL pgvector SQL equivalent:
-        CREATE EXTENSION vector;
-        CREATE TABLE documents (
-            id UUID PRIMARY KEY,
-            content TEXT NOT NULL,
-            embedding vector(1536),
-            metadata JSONB DEFAULT '{}'
-        );
-        CREATE INDEX ON documents USING hnsw (embedding vector_cosine_ops);
-
-        -- Insert
-        INSERT INTO documents (id, content, embedding, metadata)
-        VALUES ($1, $2, $3, $4);
-
-        -- Search (cosine distance — lower is better, so we negate for similarity)
-        SELECT id, content, metadata,
-               1 - (embedding <=> $1) AS similarity
-        FROM documents
-        ORDER BY embedding <=> $1
-        LIMIT 10;
+    Simulates IVFFlat indexing mechanics:
+    - Trains K centroid clusters via k-means.
+    - Partitions documents into inverted lists (Voronoi cells).
+    - Executes query search across configurable 'probes' centroids.
     """
 
-    def __init__(self):
-        self._documents: dict[str, Document] = {}
-        self._embeddings_matrix: np.ndarray | None = None
-        self._id_list: list[str] = []
-        self._dirty = True
+    def __init__(self, n_lists: int = 4):
+        self.n_lists = n_lists
+        self.centroids: Optional[np.ndarray] = None  # Shape: (K, D)
+        self.inverted_lists: Dict[int, List[Tuple[str, np.ndarray]]] = {}
 
-    def upsert(self, doc: Document) -> None:
-        """Insert or update a document."""
-        self._documents[doc.id] = doc
-        self._dirty = True
+    def fit_and_populate(self, doc_ids: List[str], vectors: np.ndarray) -> None:
+        """Clusters vectors into centroids and populates inverted lists."""
+        n_samples, dim = vectors.shape
+        assert n_samples >= self.n_lists, "Must have more samples than cluster lists"
 
-    def upsert_batch(self, docs: list[Document]) -> None:
-        """Batch upsert for efficiency."""
-        for doc in docs:
-            self._documents[doc.id] = doc
-        self._dirty = True
+        # Initialize centroids spaced across the dataset for deterministic simulation
+        step = max(1, n_samples // self.n_lists)
+        self.centroids = vectors[::step][:self.n_lists].copy()
+        self.inverted_lists = {i: [] for i in range(self.n_lists)}
 
-    def _rebuild_index(self) -> None:
-        """Rebuild the embeddings matrix for fast batch similarity."""
-        if not self._dirty or not self._documents:
-            return
-        self._id_list = list(self._documents.keys())
-        self._embeddings_matrix = np.array(
-            [self._documents[id_].embedding for id_ in self._id_list]
-        )
-        self._dirty = False
+        # Assign each vector to closest centroid (Voronoi cell)
+        for doc_id, vec in zip(doc_ids, vectors):
+            # Compute distance to all centroids
+            dists = np.linalg.norm(self.centroids - vec, axis=1)
+            closest_cluster = int(np.argmin(dists))
+            self.inverted_lists[closest_cluster].append((doc_id, vec))
 
-    def search(
-        self,
-        query_embedding: np.ndarray,
-        top_k: int = 5,
-        metadata_filter: dict[str, Any] | None = None,
-        score_threshold: float | None = None,
-    ) -> list[SearchResult]:
+    def search(self, query: np.ndarray, probes: int = 1, top_k: int = 3) -> List[Tuple[str, float]]:
         """
-        Similarity search — find the K nearest documents.
-
-        Args:
-            query_embedding: The query vector.
-            top_k: Number of results to return.
-            metadata_filter: Optional {key: value} filter. All must match.
-            score_threshold: Optional minimum similarity score.
+        Searches nearest centroids up to 'probes' depth, scanning only
+        vectors within those inverted lists.
         """
-        self._rebuild_index()
-        if self._embeddings_matrix is None or len(self._id_list) == 0:
-            return []
+        assert self.centroids is not None, "Index must be trained before search"
+        probes = min(probes, self.n_lists)
 
-        # Vectorized cosine similarity: matrix @ query
-        # For normalized vectors, this gives cosine similarity directly
-        similarities = self._embeddings_matrix @ query_embedding
+        # 1. Find nearest centroids to query
+        centroid_dists = np.linalg.norm(self.centroids - query, axis=1)
+        probed_clusters = np.argsort(centroid_dists)[:probes]
 
-        # Get sorted indices (descending similarity)
-        sorted_indices = np.argsort(similarities)[::-1]
+        # 2. Scan vectors only in probed inverted lists
+        candidates: List[Tuple[str, float]] = []
+        for cluster_idx in probed_clusters:
+            for doc_id, vec in self.inverted_lists[cluster_idx]:
+                dist = float(np.linalg.norm(vec - query))
+                candidates.append((doc_id, dist))
 
-        results = []
-        for idx in sorted_indices:
-            if len(results) >= top_k:
-                break
-
-            doc_id = self._id_list[idx]
-            doc = self._documents[doc_id]
-            score = float(similarities[idx])
-
-            # Apply score threshold
-            if score_threshold is not None and score < score_threshold:
-                break  # Since sorted, all remaining will be lower
-
-            # Apply metadata filter
-            if metadata_filter:
-                if not all(
-                    doc.metadata.get(k) == v for k, v in metadata_filter.items()
-                ):
-                    continue
-
-            results.append(SearchResult(document=doc, score=score))
-
-        return results
-
-    def delete(self, doc_id: str) -> bool:
-        """Delete a document by ID."""
-        if doc_id in self._documents:
-            del self._documents[doc_id]
-            self._dirty = True
-            return True
-        return False
-
-    def count(self) -> int:
-        return len(self._documents)
+        # 3. Sort candidates and return top K
+        candidates.sort(key=lambda x: x[1])
+        return candidates[:top_k]
 
 
-# ── Mock Embedding Model (from file 02) ──────────────────────────────
+# ==============================================================================
+# 3. RECIPROCAL RANK FUSION (HYBRID SEARCH ENGINE)
+# ==============================================================================
 
-class SimpleEmbedder:
-    """Simple deterministic embedder for demonstrations."""
+class ReciprocalRankFusion:
+    """
+    Implements standard Reciprocal Rank Fusion (RRF) to merge
+    dense vector rankings with sparse keyword BM25 rankings.
+    """
 
-    def __init__(self, dims: int = 64):
-        self.dims = dims
+    @staticmethod
+    def fuse_rankings(
+        vector_ranked_ids: List[str],
+        keyword_ranked_ids: List[str],
+        k: int = 60
+    ) -> List[Tuple[str, float]]:
+        """
+        Calculates RRF score: sum(1 / (k + rank)) across both ranked result lists.
+        """
+        scores: Dict[str, float] = {}
 
-    def embed(self, text: str) -> np.ndarray:
-        np.random.seed(hash(text.lower().strip()) % (2**31))
-        vec = np.random.randn(self.dims).astype(np.float32)
-        # Topic-based nudging for semantic similarity
-        lower = text.lower()
-        if any(w in lower for w in ["python", "code", "programming", "developer"]):
-            vec[:4] += np.array([2.0, 1.0, 0.5, 0.0], dtype=np.float32)
-        if any(w in lower for w in ["machine", "learning", "ai", "model", "neural"]):
-            vec[4:8] += np.array([2.0, 1.0, 0.5, 0.0], dtype=np.float32)
-        if any(w in lower for w in ["database", "sql", "postgres", "query"]):
-            vec[8:12] += np.array([2.0, 1.0, 0.5, 0.0], dtype=np.float32)
-        if any(w in lower for w in ["food", "cooking", "recipe", "restaurant"]):
-            vec[12:16] += np.array([2.0, 1.0, 0.5, 0.0], dtype=np.float32)
-        norm = np.linalg.norm(vec)
-        return vec / norm if norm > 0 else vec
+        # Process vector ranks (1-based index)
+        for rank_idx, doc_id in enumerate(vector_ranked_ids, start=1):
+            scores[doc_id] = scores.get(doc_id, 0.0) + (1.0 / (k + rank_idx))
 
-    def embed_batch(self, texts: list[str]) -> list[np.ndarray]:
-        return [self.embed(t) for t in texts]
+        # Process keyword ranks (1-based index)
+        for rank_idx, doc_id in enumerate(keyword_ranked_ids, start=1):
+            scores[doc_id] = scores.get(doc_id, 0.0) + (1.0 / (k + rank_idx))
 
-
-# ── Demonstration Functions ──────────────────────────────────────────────
-
-def demonstrate_vector_store_crud():
-    """Basic CRUD operations on the vector store."""
-    store = InMemoryVectorStore()
-    embedder = SimpleEmbedder(dims=64)
-
-    # Insert documents
-    docs = [
-        ("doc1", "Python is great for web development", {"category": "programming", "year": 2024}),
-        ("doc2", "Machine learning models require training data", {"category": "ai", "year": 2024}),
-        ("doc3", "SQL databases store structured data", {"category": "database", "year": 2023}),
-        ("doc4", "Italian cooking uses olive oil and fresh herbs", {"category": "food", "year": 2023}),
-        ("doc5", "Neural networks are inspired by the brain", {"category": "ai", "year": 2024}),
-        ("doc6", "PostgreSQL supports JSON and vector columns", {"category": "database", "year": 2024}),
-    ]
-
-    for doc_id, text, meta in docs:
-        store.upsert(Document(
-            id=doc_id,
-            text=text,
-            embedding=embedder.embed(text),
-            metadata=meta,
-        ))
-
-    print(f"  Inserted {store.count()} documents")
-
-    # Search
-    query = "How to build AI with Python?"
-    query_emb = embedder.embed(query)
-    results = store.search(query_emb, top_k=3)
-
-    print(f"\n  Query: '{query}'")
-    print(f"  Top 3 results:")
-    for r in results:
-        print(f"    {r.score:.4f} | [{r.document.id}] {r.document.text}")
-
-    # Delete
-    store.delete("doc4")
-    print(f"\n  After delete: {store.count()} documents")
-
-    return store
+        # Sort descending by fused RRF score
+        fused = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        return fused
 
 
-def demonstrate_metadata_filtering():
-    """Combining vector search with metadata filters."""
-    store = InMemoryVectorStore()
-    embedder = SimpleEmbedder(dims=64)
+# ==============================================================================
+# 4. SELF-TESTING SUITE
+# ==============================================================================
 
-    docs = [
-        ("d1", "Python web framework Flask", {"category": "programming", "language": "python"}),
-        ("d2", "JavaScript React frontend", {"category": "programming", "language": "javascript"}),
-        ("d3", "Python machine learning scikit", {"category": "ai", "language": "python"}),
-        ("d4", "TensorFlow deep learning models", {"category": "ai", "language": "python"}),
-        ("d5", "Node.js Express API backend", {"category": "programming", "language": "javascript"}),
-    ]
+def run_tests() -> None:
+    print("\n[*] Starting automated test suite for 03_vector_databases_pgvector.py...")
 
-    store.upsert_batch([
-        Document(id=id_, text=text, embedding=embedder.embed(text), metadata=meta)
-        for id_, text, meta in docs
+    # ------------------------------------------------------------
+    # Test 1: pgvector SQL Schema Syntax Validation
+    # ------------------------------------------------------------
+    print("  -> Validating PostgreSQL pgvector DDL and index specifications...")
+    assert "CREATE EXTENSION IF NOT EXISTS vector;" in PGVECTOR_SQL_SCHEMA
+    assert "vector(1536)" in PGVECTOR_SQL_SCHEMA
+    assert "USING hnsw (embedding vector_cosine_ops)" in PGVECTOR_SQL_SCHEMA
+    assert "WITH (m = 16, ef_construction = 64)" in PGVECTOR_SQL_SCHEMA
+    assert "USING gin (tsv_content)" in PGVECTOR_SQL_SCHEMA
+
+    # ------------------------------------------------------------
+    # Test 2: IVFFlat Centroid Partitioning & Probing Tradeoff
+    # ------------------------------------------------------------
+    print("  -> Testing IVFFlat inverted file partitioning and probes scaling...")
+    ivf = IVFFlatSimulator(n_lists=3)
+
+    # 6 vectors in 2D space:
+    # Cluster 0: near (0, 0)
+    # Cluster 1: near (10, 10)
+    # Cluster 2: near (50, 50)
+    doc_ids = ["doc_0a", "doc_0b", "doc_1a", "doc_1b", "doc_2a", "doc_2b"]
+    vectors = np.array([
+        [0.0, 0.1], [0.1, 0.0],
+        [10.0, 10.1], [10.2, 9.9],
+        [50.0, 50.1], [50.1, 49.9]
     ])
 
-    query_emb = embedder.embed("Python programming")
+    ivf.fit_and_populate(doc_ids, vectors)
 
-    # Without filter
-    all_results = store.search(query_emb, top_k=5)
-    print("  All results (no filter):")
-    for r in all_results:
-        print(f"    {r.score:.4f} | {r.document.metadata} | {r.document.text}")
+    # Query near Cluster 0
+    query_near_0 = np.array([0.05, 0.05])
 
-    # With metadata filter — only Python documents
-    python_results = store.search(
-        query_emb, top_k=5,
-        metadata_filter={"language": "python"},
+    # Probe 1: searches only nearest cluster (Cluster 0)
+    res_p1 = ivf.search(query_near_0, probes=1, top_k=2)
+    assert len(res_p1) == 2
+    assert {res_p1[0][0], res_p1[1][0]} == {"doc_0a", "doc_0b"}
+
+    # Probe 3: searches all clusters
+    res_p3 = ivf.search(query_near_0, probes=3, top_k=6)
+    assert len(res_p3) == 6
+    assert res_p3[0][0] in ["doc_0a", "doc_0b"]  # Nearest must be first
+
+    # ------------------------------------------------------------
+    # Test 3: Reciprocal Rank Fusion (Hybrid Search Alignment)
+    # ------------------------------------------------------------
+    print("  -> Testing Reciprocal Rank Fusion (RRF) rank aggregation...")
+    # Dense vector ranking (semantic understanding)
+    vector_results = ["doc_A", "doc_B", "doc_C", "doc_D"]
+    # Keyword ranking (exact keyword match)
+    keyword_results = ["doc_E", "doc_A", "doc_F", "doc_B"]
+
+    # Fusing rankings: doc_A is #1 in vector and #2 in keyword -> MUST BE #1 OVERALL
+    fused_results = ReciprocalRankFusion.fuse_rankings(
+        vector_results, keyword_results, k=60
     )
-    print("\n  Filtered (language=python):")
-    for r in python_results:
-        print(f"    {r.score:.4f} | {r.document.metadata} | {r.document.text}")
 
-    # With score threshold
-    high_sim = store.search(query_emb, top_k=5, score_threshold=0.5)
-    print(f"\n  High similarity only (>0.5): {len(high_sim)} results")
+    top_doc_id, top_score = fused_results[0]
+    assert top_doc_id == "doc_A", f"Expected doc_A at top of fused ranks, got {top_doc_id}"
 
-    return python_results
+    # Calculate expected mathematical RRF score for doc_A:
+    # 1 / (60 + 1) [from vector] + 1 / (60 + 2) [from keyword]
+    expected_score_a = (1.0 / 61.0) + (1.0 / 62.0)
+    assert np.isclose(top_score, expected_score_a)
 
+    # Verify doc_B ranks highly as well (present in both lists)
+    doc_b_rank = [item[0] for item in fused_results].index("doc_B")
+    assert doc_b_rank in [1, 2]
 
-def demonstrate_pgvector_sql():
-    """Show the actual pgvector SQL patterns (conceptual, not executed)."""
-    print("  === pgvector SQL Patterns ===")
-    print()
-
-    sql_examples = {
-        "Create Extension": "CREATE EXTENSION IF NOT EXISTS vector;",
-
-        "Create Table": """
-    CREATE TABLE documents (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        content TEXT NOT NULL,
-        embedding vector(1536),
-        metadata JSONB DEFAULT '{}',
-        created_at TIMESTAMPTZ DEFAULT now()
-    );""",
-
-        "Create HNSW Index": """
-    -- HNSW: Fast, high recall, more memory
-    -- m=16: max connections per node (higher = better recall, more RAM)
-    -- ef_construction=64: build-time quality (higher = better, slower build)
-    CREATE INDEX idx_docs_embedding ON documents
-    USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);""",
-
-        "Create IVFFlat Index": """
-    -- IVFFlat: Less memory, requires training step
-    -- lists: number of clusters (sqrt(N) is a good starting point)
-    CREATE INDEX idx_docs_embedding_ivf ON documents
-    USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);""",
-
-        "Insert": """
-    INSERT INTO documents (content, embedding, metadata)
-    VALUES ($1, $2::vector, $3::jsonb);""",
-
-        "Cosine Search": """
-    -- <=> is cosine distance (1 - similarity), so lower = better
-    SELECT id, content, metadata,
-           1 - (embedding <=> $1::vector) AS similarity
-    FROM documents
-    WHERE metadata->>'category' = 'programming'
-    ORDER BY embedding <=> $1::vector
-    LIMIT 10;""",
-
-        "L2 Search": """
-    -- <-> is L2 (Euclidean) distance
-    SELECT id, content, 1 / (1 + (embedding <-> $1::vector)) AS similarity
-    FROM documents
-    ORDER BY embedding <-> $1::vector
-    LIMIT 10;""",
-
-        "Hybrid Search (BM25 + Vector)": """
-    -- Combine keyword search (ts_rank) with vector search
-    -- Uses Reciprocal Rank Fusion (RRF)
-    WITH keyword_results AS (
-        SELECT id, ts_rank(to_tsvector(content), plainto_tsquery($2)) AS keyword_rank
-        FROM documents
-        WHERE to_tsvector(content) @@ plainto_tsquery($2)
-    ),
-    vector_results AS (
-        SELECT id, 1 - (embedding <=> $1::vector) AS vector_score
-        FROM documents
-        ORDER BY embedding <=> $1::vector
-        LIMIT 20
-    )
-    SELECT COALESCE(k.id, v.id) AS id,
-           COALESCE(1.0 / (60 + kr.rn), 0) + COALESCE(1.0 / (60 + vr.rn), 0) AS rrf_score
-    FROM ...  -- RRF combines both rankings
-    ORDER BY rrf_score DESC
-    LIMIT 10;""",
-    }
-
-    for name, sql in sql_examples.items():
-        print(f"  [{name}]")
-        for line in sql.strip().split("\n"):
-            print(f"    {line}")
-        print()
-
-
-def demonstrate_index_comparison():
-    """Compare vector index strategies."""
-    print("  === Vector Index Comparison ===")
-    print()
-    print(f"  {'Index':<12} {'Search':<10} {'Build':<10} {'Memory':<10} {'Recall':<10} {'Best For'}")
-    print(f"  {'-'*12} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*20}")
-    print(f"  {'Flat/Brute':<12} {'O(N*D)':<10} {'O(1)':<10} {'Low':<10} {'100%':<10} {'<10K vectors'}")
-    print(f"  {'IVFFlat':<12} {'O(N/L*D)':<10} {'O(N*D)':<10} {'Medium':<10} {'~95%':<10} {'Cost-sensitive'}")
-    print(f"  {'HNSW':<12} {'O(logN*D)':<10} {'O(N*logN)':<10} {'High':<10} {'~99%':<10} {'Production default'}")
-    print()
-    print("  HNSW parameters:")
-    print("    m (max connections): 16 default, higher = better recall, more RAM")
-    print("    ef_construction: 64 default, higher = better quality, slower build")
-    print("    ef_search: 40 default, higher = better recall, slower query")
-    print()
-    print("  Rule of thumb: Start with HNSW for everything. Only use IVFFlat")
-    print("  if memory is a hard constraint. Never go flat in production.")
-
-
-# ══════════════════════════════════════════════════════════════════════
-# SELF-TEST CHALLENGES
-# ══════════════════════════════════════════════════════════════════════
-
-def run_tests():
-    """Automated verification."""
-    print("\n[*] Running automated self-tests...")
-
-    embedder = SimpleEmbedder(dims=64)
-
-    # Test 1: Vector store insert and count
-    store = InMemoryVectorStore()
-    doc = Document(id="t1", text="test", embedding=embedder.embed("test"), metadata={})
-    store.upsert(doc)
-    assert store.count() == 1, "Store should have 1 document"
-
-    # Test 2: Batch upsert
-    docs = [
-        Document(id=f"t{i}", text=f"text {i}", embedding=embedder.embed(f"text {i}"))
-        for i in range(2, 6)
-    ]
-    store.upsert_batch(docs)
-    assert store.count() == 5, "Store should have 5 documents"
-
-    # Test 3: Search returns results
-    query_emb = embedder.embed("test query")
-    results = store.search(query_emb, top_k=3)
-    assert len(results) <= 3, "Should return at most top_k results"
-    assert len(results) > 0, "Should return at least 1 result"
-
-    # Test 4: Results are sorted by score (descending)
-    scores = [r.score for r in results]
-    assert scores == sorted(scores, reverse=True), "Results should be sorted desc"
-
-    # Test 5: Search result structure
-    assert hasattr(results[0], 'document'), "Result should have document"
-    assert hasattr(results[0], 'score'), "Result should have score"
-    assert isinstance(results[0].document, Document), "Should be a Document"
-
-    # Test 6: Delete
-    assert store.delete("t1"), "Delete should return True for existing doc"
-    assert store.count() == 4, "Count should decrease after delete"
-    assert not store.delete("nonexistent"), "Delete should return False for missing doc"
-
-    # Test 7: Metadata filtering
-    store2 = InMemoryVectorStore()
-    store2.upsert(Document("a", "python code", embedder.embed("python code"), {"lang": "python"}))
-    store2.upsert(Document("b", "js code", embedder.embed("js code"), {"lang": "javascript"}))
-    store2.upsert(Document("c", "more python", embedder.embed("more python"), {"lang": "python"}))
-
-    py_results = store2.search(
-        embedder.embed("programming"),
-        top_k=10,
-        metadata_filter={"lang": "python"},
-    )
-    assert all(r.document.metadata["lang"] == "python" for r in py_results),         "All filtered results should be Python"
-
-    # Test 8: Score threshold
-    high_results = store2.search(
-        embedder.embed("python code"),
-        top_k=10,
-        score_threshold=0.99,  # Very high threshold
-    )
-    assert all(r.score >= 0.99 for r in high_results), "All should be above threshold"
-
-    # Test 9: Upsert updates existing document
-    store3 = InMemoryVectorStore()
-    store3.upsert(Document("x", "old text", embedder.embed("old text")))
-    store3.upsert(Document("x", "new text", embedder.embed("new text")))
-    assert store3.count() == 1, "Upsert should update, not duplicate"
-
-    # Test 10: Empty store search returns empty
-    empty_store = InMemoryVectorStore()
-    empty_results = empty_store.search(embedder.embed("query"))
-    assert empty_results == [], "Empty store should return empty results"
-
-    print("[SUCCESS] All 10 Vector Database self-tests passed!")
+    print("[SUCCESS] All 3 pgvector, IVFFlat & RRF Hybrid Search tests passed cleanly!")
 
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("Phase 10: Vector Databases & pgvector")
+    print("Phase 10 - 03: Vector Databases, pgvector & HNSW/IVFFlat Indexing")
     print("=" * 70)
-    print("\n--- Vector Store CRUD ---")
-    demonstrate_vector_store_crud()
-    print("\n--- Metadata Filtering ---")
-    demonstrate_metadata_filtering()
-    print("\n--- pgvector SQL Patterns ---")
-    demonstrate_pgvector_sql()
-    print("\n--- Index Comparison ---")
-    demonstrate_index_comparison()
-    print("-" * 70)
     run_tests()
     print("=" * 70)

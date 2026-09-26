@@ -1,309 +1,295 @@
-"""
-Phase 9: Pandas DataFrame & Series
-================================================================================
-1. CONCEPT & JS/TS ANALOGY:
-   - Concept: Pandas provides labeled, tabular data structures. A DataFrame is
-     a 2D table (like a spreadsheet or SQL result set) with named columns and
-     an index. A Series is a single labeled column.
-   - JS/TS Equivalent: Think of a DataFrame like an array of uniform objects
-     `[{name: "Alice", age: 30}, {name: "Bob", age: 25}]`, but with NumPy
-     performance. In JS you'd use lodash/Ramda for groupBy, sortBy, filter —
-     Pandas gives you all of that built-in with a consistent, chainable API.
-   - Key difference: Pandas is built ON TOP of NumPy. Each column is stored
-     as a contiguous NumPy array under the hood. Operations are vectorized C,
-     not Python loops.
+r"""
+02_pandas_dataframes.py
 
-2. UNDER THE HOOD (CPython & Memory):
-   - A DataFrame is a dict-like container of Series objects, each backed by a
-     NumPy ndarray. The BlockManager organizes columns by dtype into contiguous
-     memory blocks — all int64 columns share one block, all float64 another.
-   - This columnar layout means column-wise operations are cache-friendly and
-     fast. Row-wise iteration (df.iterrows()) is SLOW because it crosses
-     dtype boundaries and creates temporary Series objects per row.
-   - Pandas uses Copy-on-Write (CoW) in newer versions (2.0+): when you slice
-     a DataFrame, it shares memory until you modify it, then copies lazily.
+============================================================
+1. CONCEPT
+============================================================
 
-3. COMMON GOTCHA:
-   - SettingWithCopyWarning: `df[df['age'] > 25]['name'] = 'X'` does NOT modify
-     df — it modifies a temporary copy. Use df.loc[mask, 'name'] = 'X' instead.
-     This is the #1 Pandas trap. In JS, chained property access always works
-     on the original object — in Pandas, chained indexing creates temporaries.
+Pandas is the industry-standard data manipulation and analysis library in Python.
+It introduces labeled, multi-dimensional structures optimized for tabular analytics:
 
-4. 🎙️ INTERVIEW READINESS: VERBAL RESPONSE SCRIPT
-   - Interview Question: "How is a Pandas DataFrame stored in memory?"
-   - How to Answer Out Loud (60-90 sec verbal script):
-     * "A DataFrame is essentially a collection of Series objects, each backed
-       by a contiguous NumPy array. The BlockManager groups columns by dtype
-       into memory blocks — all int64 columns in one block, all float64 in
-       another — which makes columnar operations cache-efficient."
-     * "This is why column operations like df['price'].mean() are fast — it's
-       a single NumPy operation on contiguous memory. But df.iterrows() is
-       slow because it constructs a Series per row, crossing dtype boundaries."
-     * "For filtering, always use .loc[mask, col] or .query() — never chained
-       indexing like df[mask]['col'] = val, which creates ambiguous copies."
-================================================================================
+1. Core Data Structures:
+   - `pd.Series`: 1D labeled homogeneous array wrapping a NumPy ndarray or PyArrow buffer.
+     Composed of values, an explicit `Index`, and a `name`.
+   - `pd.DataFrame`: 2D labeled tabular container composed of ordered columns.
+     Columns are aligned on a shared `Index`.
+
+2. Indexing Paradigms (`.loc` vs `.iloc`):
+   - `.loc[row_label, col_label]`: Label-based indexing.
+     * Accepts explicit row/column labels, boolean masks, and slices.
+     * NOTE: Label slices `loc['A':'C']` are INCLUSIVE of both start and stop!
+   - `.iloc[row_pos, col_pos]`: Integer position-based indexing (0 to $N-1$).
+     * Adheres to standard Python indexing rules (exclusive of stop: `iloc[0:3]` returns rows 0, 1, 2).
+
+3. High-Performance Vectorized Transformations:
+   - Vectorized Arithmetic: Column operations execute at C-speed (`df["total"] = df["qty"] * df["unit_price"]`).
+   - Conditional Column Branching: Avoid slow `.apply(lambda ...)` loops by using compiled NumPy
+     branching: `np.where(condition, true_val, false_val)` or `np.select(conditions, choices)`.
+
+4. Split-Apply-Combine (`groupby`):
+   - Partitions rows into groups by unique key values, applies aggregation/transformation functions,
+     and combines results into a new DataFrame.
+   - Named Aggregations: `df.groupby("dept").agg(avg_sal=("salary", "mean"), headcount=("id", "count"))`.
+
+5. Relational Merges and Joins:
+   - `pd.merge(left, right, on="key", how="inner|left|right|outer")`: Executes relational SQL-style joins.
+
+
+============================================================
+2. JS / TS ANALOGY
+============================================================
+
++------------------------------+------------------------------------+------------------------------------+
+| Feature                      | Python (Pandas)                    | JavaScript / TypeScript (Node.js)  |
++------------------------------+------------------------------------+------------------------------------+
+| Table Container              | `pd.DataFrame`                     | `Array<Record<string, any>>`       |
+| Column Access                | `df["price"]` (vectorized Series)  | `items.map(x => x.price)`          |
+| Row Filtering                | `df.loc[df["age"] >= 21]`          | `items.filter(x => x.age >= 21)`   |
+| Position Slicing             | `df.iloc[0:10]`                    | `items.slice(0, 10)`               |
+| Aggregation / Grouping       | `df.groupby("city")["age"].mean()` | Custom `reduce()` or Lodash        |
+| Relational Join              | `pd.merge(users, orders, on="id")` | Manual nested loops / hash maps    |
+| Conditional Mapping          | `np.where(df["score"] > 80, "A")`  | `items.map(x => x.score > 80 ? ..)`|
++------------------------------+------------------------------------+------------------------------------+
+
+Key JS vs Python Architecture Differences:
+1. In JavaScript, transforming a dataset using `.filter().map()` instantiates intermediate
+   heap-allocated JavaScript arrays and objects at every step, creating high garbage-collection
+   pressure on large datasets.
+2. In Pandas, operations are executed columnar-wise across contiguous C-memory blocks with SIMD
+   vectorization, bypassing Python interpreter overhead.
+
+
+============================================================
+3. UNDER THE HOOD (BlockManager & Memory Mechanics)
+============================================================
+
+1. The Columnar BlockManager:
+   - A Pandas DataFrame does NOT store rows in memory.
+   - It organizes columns into homogenous multi-column contiguous 2D memory blocks managed
+     by an internal `BlockManager`:
+     * `FloatBlock`: Contains all `float64` columns.
+     * `IntBlock`: Contains all `int64` columns.
+     * `ObjectBlock`: Stores pointers to arbitrary Python objects or strings.
+   - Columnar operations like `df["salary"].mean()` access a single contiguous memory block
+     with optimal CPU cache locality.
+
+2. Why `df.iterrows()` Is Catastrophically Slow:
+   - `iterrows()` transposes columnar blocks into rows on every iteration.
+   - For every single row, it instantiates a brand-new Python `pd.Series` object on the heap,
+     upcasting all types to `object`.
+   - Iterating over 100,000 rows with `iterrows()` takes seconds to minutes; vectorized operations
+     execute in milliseconds (a 1,000x speed difference).
+
+3. Modern Copy-on-Write (CoW):
+   - In modern Pandas (2.0+), slices of DataFrames return references that share memory buffers
+     lazily until an actual write operation occurs.
+   - Only when a column in the slice is modified does Pandas trigger an explicit copy of that
+     specific column buffer, eliminating accidental mutations and defensive copies.
+
+
+============================================================
+4. COMMON GOTCHAS
+============================================================
+
+1. The `SettingWithCopyWarning`:
+   - Writing `df[df["age"] > 25]["status"] = "Senior"` performs chained indexing:
+     `df[mask]` creates a temporary slice, and `['status'] = ...` attempts to mutate that temporary object.
+   - The original DataFrame `df` may NOT be updated, and Python emits `SettingWithCopyWarning`.
+   - FIX: Always use `.loc` for assignment: `df.loc[df["age"] > 25, "status"] = "Senior"`.
+
+2. The `.apply(lambda ...)` Trap:
+   - Using `.apply()` is simply a Python `for` loop hidden behind a method call.
+   - It loses SIMD acceleration and forces Python interpreter context switches on every row.
+   - FIX: Use built-in vectorized methods, string accessors (`.str`), or `np.where()`.
+
+3. Storing Categorical Strings as `object`:
+   - An `object` column stores individual 8-byte pointers to Python string objects, wasting RAM.
+   - Converting repetitive text columns (e.g. state, country, status) to `category` dtype
+     replaces strings with integer codes, reducing memory consumption by up to 90%.
+
+
+============================================================
+5. INTERVIEW READINESS (VERBAL SCRIPTS)
+============================================================
+
+Q1: "Explain how Pandas stores a DataFrame in memory and why you should avoid `df.iterrows()`."
+A1: "Under the hood, Pandas uses a columnar `BlockManager` that groups columns of the same dtype into
+     contiguous 2D NumPy memory arrays—for instance, grouping all float columns into a single contiguous
+     buffer. This layout makes column-wise arithmetic extremely fast and cache-efficient.
+     `df.iterrows()` is an anti-pattern because it forces row-wise access: on every iteration, Pandas
+     must slice across disparate memory blocks, cast heterogeneous types to `object`, and instantiate
+     a brand-new Python `Series` object on the heap. This causes massive memory overhead and degrades
+     execution speeds by up to a thousand times compared to native vectorized column operations."
+
+Q2: "What is the `SettingWithCopyWarning` and how do you resolve it?"
+A2: "The `SettingWithCopyWarning` occurs during chained assignment, such as `df[df['active'] == True]['tier'] = 'Gold'`.
+     In chained indexing, Python first executes `df[condition]`, which may return either a view or a temporary
+     memory copy. The second operation `['tier'] = ...` modifies that intermediate object. If it was a copy,
+     the modification is lost and never reflected in the parent DataFrame.
+     To fix it, we use single-index assignment with `.loc`: `df.loc[df['active'] == True, 'tier'] = 'Gold'`.
+     This directly references the parent DataFrame's memory buffer in a single atomic operation."
+
+Q3: "How do you conditionally create new columns in Pandas without using `.apply()`?"
+A3: "Instead of calling `.apply()` with a Python lambda—which iterates row-by-row in Python bytecode—I use
+     vectorized NumPy functions like `np.where()` for binary conditions or `np.select()` for multi-condition logic.
+     For example, `df['status'] = np.where(df['score'] >= 70, 'PASS', 'FAIL')`. This evaluates the condition
+     and assigns values entirely inside compiled C loops without creating Python-level function call frames,
+     achieving 50 to 100 times faster execution."
 """
 
 import sys
-if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
-    try: sys.stdout.reconfigure(encoding='utf-8')
-    except Exception: pass
-
+import warnings
+warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
-import json
-import tempfile
-from pathlib import Path
+
+# Ensure UTF-8 output encoding across Windows terminals
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 
-# ── Demonstration Functions ──────────────────────────────────────────────
+# ==============================================================================
+# 1. CORE PIPELINE OPERATIONS
+# ==============================================================================
 
-def demonstrate_series_basics():
-    """Series: labeled 1D array — the building block of DataFrames."""
-    # From a list — auto integer index
-    s = pd.Series([10, 20, 30, 40], name="scores")
-    print(f"  Series:\n{s}")
-    print(f"  dtype={s.dtype}, shape={s.shape}")
-
-    # From a dict — keys become index
-    temps = pd.Series({"NYC": 72, "LA": 85, "CHI": 68}, name="temp_f")
-    print(f"\n  Named index Series:\n{temps}")
-    print(f"  temps['NYC'] = {temps['NYC']}")  # Label-based access
-    print(f"  temps.iloc[0] = {temps.iloc[0]}")  # Position-based access
-
-    # Vectorized operations — just like NumPy
-    celsius = (temps - 32) * 5 / 9
-    print(f"\n  Celsius:\n{celsius.round(1)}")
-
-    return s, temps
-
-
-def demonstrate_dataframe_creation():
-    """Multiple ways to create DataFrames."""
-    # From dict of lists (most common)
-    df = pd.DataFrame({
-        "name": ["Alice", "Bob", "Charlie", "Diana"],
-        "age": [30, 25, 35, 28],
-        "city": ["NYC", "LA", "NYC", "CHI"],
-        "salary": [95000, 82000, 115000, 78000],
+def build_sample_dataset() -> pd.DataFrame:
+    """Creates a sample enterprise employee and payroll dataset."""
+    return pd.DataFrame({
+        "emp_id": [101, 102, 103, 104, 105, 106],
+        "name": ["Alice", "Bob", "Charlie", "Diana", "Evan", "Fiona"],
+        "department": ["Engineering", "Sales", "Engineering", "Marketing", "Engineering", "Sales"],
+        "salary": [135000, 85000, 150000, 92000, 115000, 98000],
+        "years_experience": [7, 3, 10, 4, 5, 6],
+        "rating": [4.8, 3.9, 4.9, 4.1, 4.2, 4.6]
     })
-    print(f"  DataFrame from dict:\n{df}")
-    print(f"  dtypes:\n{df.dtypes}")
-    print(f"  shape: {df.shape} (rows, cols)")
-    print(f"  columns: {list(df.columns)}")
 
-    # From list of dicts (like JS array of objects)
-    records = [
-        {"product": "Widget", "price": 9.99, "qty": 100},
-        {"product": "Gadget", "price": 24.99, "qty": 50},
+
+def compute_compensation_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Demonstrates vectorized transformations and conditional branching
+    without slow row-by-row .apply() loops.
+    """
+    # Create working copy to maintain functional purity
+    result_df = df.copy()
+
+    # 1. Vectorized bonus calculation: salary * 0.15 for high rating (>= 4.5), else 0.05
+    bonus_multiplier = np.where(result_df["rating"] >= 4.5, 0.15, 0.05)
+    result_df["bonus"] = (result_df["salary"] * bonus_multiplier).round(2)
+    result_df["total_comp"] = result_df["salary"] + result_df["bonus"]
+
+    # 2. Multi-condition seniority mapping using np.select
+    conditions = [
+        result_df["years_experience"] >= 8,
+        result_df["years_experience"] >= 5,
     ]
-    df2 = pd.DataFrame(records)
-    print(f"\n  From records:\n{df2}")
+    choices = ["Principal / Staff", "Senior"]
+    result_df["seniority_level"] = np.select(conditions, choices, default="Associate / Mid")
 
-    return df
+    return result_df
 
 
-def demonstrate_selection_and_filtering():
-    """Column selection, row filtering, loc vs iloc."""
-    df = pd.DataFrame({
-        "name": ["Alice", "Bob", "Charlie", "Diana", "Eve"],
-        "dept": ["eng", "sales", "eng", "sales", "eng"],
-        "salary": [95000, 82000, 115000, 78000, 105000],
-        "years": [5, 3, 8, 2, 6],
+# ==============================================================================
+# 2. SELF-TESTING SUITE
+# ==============================================================================
+
+def run_tests() -> None:
+    print("\n[*] Starting automated test suite for 02_pandas_dataframes.py...")
+
+    # ------------------------------------------------------------
+    # Test 1: Series & DataFrame Creation and Types
+    # ------------------------------------------------------------
+    print("  -> Testing DataFrame construction, indexing and schema validation...")
+    df = build_sample_dataset()
+    assert df.shape == (6, 6)
+    assert list(df.columns) == ["emp_id", "name", "department", "salary", "years_experience", "rating"]
+    assert df["salary"].dtype in [np.int64, np.int32]
+    assert df["rating"].dtype == np.float64
+
+    # ------------------------------------------------------------
+    # Test 2: Indexing with .loc vs .iloc
+    # ------------------------------------------------------------
+    print("  -> Testing .loc (label-based) vs .iloc (position-based) indexing...")
+    # .loc with boolean mask: filter Engineering department
+    eng_loc = df.loc[df["department"] == "Engineering", ["name", "salary"]]
+    assert len(eng_loc) == 3
+    assert list(eng_loc["name"]) == ["Alice", "Charlie", "Evan"]
+
+    # .iloc with positional slice: first 2 rows, first 3 columns
+    subset_iloc = df.iloc[0:2, 0:3]
+    assert subset_iloc.shape == (2, 3)
+    assert list(subset_iloc.columns) == ["emp_id", "name", "department"]
+    assert subset_iloc.iloc[0, 1] == "Alice"
+    assert subset_iloc.iloc[1, 1] == "Bob"
+
+    # ------------------------------------------------------------
+    # Test 3: SettingWithCopy Safe Assignment via .loc
+    # ------------------------------------------------------------
+    print("  -> Testing mutation and safe assignment via .loc...")
+    df_mut = df.copy()
+    # Correct assignment using .loc (avoids SettingWithCopyWarning)
+    df_mut.loc[df_mut["name"] == "Bob", "salary"] = 90000
+    assert df_mut.loc[df_mut["name"] == "Bob", "salary"].values[0] == 90000
+    # Original remains untouched
+    assert df.loc[df["name"] == "Bob", "salary"].values[0] == 85000
+
+    # ------------------------------------------------------------
+    # Test 4: Vectorized Calculations & np.select Branching
+    # ------------------------------------------------------------
+    print("  -> Testing vectorized metrics computation and conditional branching...")
+    processed_df = compute_compensation_metrics(df)
+
+    # Check Charlie: rating 4.9 -> bonus = 150000 * 0.15 = 22500 -> total = 172500
+    charlie_row = processed_df.loc[processed_df["name"] == "Charlie"].iloc[0]
+    assert charlie_row["bonus"] == 22500.0
+    assert charlie_row["total_comp"] == 172500.0
+    assert charlie_row["seniority_level"] == "Principal / Staff"
+
+    # Check Bob: rating 3.9 -> bonus = 85000 * 0.05 = 4250 -> total = 89250
+    bob_row = processed_df.loc[processed_df["name"] == "Bob"].iloc[0]
+    assert bob_row["bonus"] == 4250.0
+    assert bob_row["total_comp"] == 89250.0
+    assert bob_row["seniority_level"] == "Associate / Mid"
+
+    # ------------------------------------------------------------
+    # Test 5: GroupBy Aggregation & Relational Merges
+    # ------------------------------------------------------------
+    print("  -> Testing split-apply-combine GroupBy and relational merges...")
+    # GroupBy department with named aggregations
+    dept_summary = df.groupby("department").agg(
+        headcount=("emp_id", "count"),
+        avg_salary=("salary", "mean")
+    ).reset_index()
+
+    assert len(dept_summary) == 3
+    eng_summary = dept_summary.loc[dept_summary["department"] == "Engineering"].iloc[0]
+    assert eng_summary["headcount"] == 3
+    # (135000 + 150000 + 115000) / 3 = 133333.33
+    assert np.isclose(eng_summary["avg_salary"], 133333.33, atol=0.01)
+
+    # Relational Join (pd.merge)
+    benefits_df = pd.DataFrame({
+        "department": ["Engineering", "Sales", "Executive"],
+        "stock_units": [1000, 300, 5000]
     })
+    # Inner join on department
+    merged_inner = pd.merge(df, benefits_df, on="department", how="inner")
+    assert len(merged_inner) == 5  # Marketing omitted because it's not in benefits_df
 
-    # Column selection
-    names = df["name"]  # Returns Series
-    subset = df[["name", "salary"]]  # Returns DataFrame
-    print(f"  Single column (Series):\n{names.values}")
-    print(f"  Multi-column subset:\n{subset}")
+    # Left join preserves Marketing with NaN for stock_units
+    merged_left = pd.merge(df, benefits_df, on="department", how="left")
+    assert len(merged_left) == 6
+    marketing_row = merged_left.loc[merged_left["department"] == "Marketing"].iloc[0]
+    assert pd.isna(marketing_row["stock_units"])
 
-    # Row filtering with boolean mask
-    engineers = df[df["dept"] == "eng"]
-    print(f"\n  Engineers:\n{engineers}")
-
-    # Complex filtering — use & (and), | (or), ~ (not) with parens
-    senior_eng = df[(df["dept"] == "eng") & (df["years"] >= 5)]
-    print(f"\n  Senior engineers (>= 5 yrs):\n{senior_eng}")
-
-    # .loc — label-based: [row_mask, column_names]
-    result = df.loc[df["salary"] > 90000, ["name", "salary"]]
-    print(f"\n  .loc filtered:\n{result}")
-
-    # .iloc — integer position-based (like array indexing)
-    first_two = df.iloc[0:2, 0:2]  # First 2 rows, first 2 columns
-    print(f"\n  .iloc[0:2, 0:2]:\n{first_two}")
-
-    # .query() — SQL-like string syntax (cleaner for complex filters)
-    queried = df.query("dept == 'eng' and salary > 100000")
-    print(f"\n  .query() result:\n{queried}")
-
-    return df
-
-
-def demonstrate_csv_json_io():
-    """Reading and writing CSV/JSON files."""
-    df = pd.DataFrame({
-        "product": ["Widget", "Gadget", "Doohickey"],
-        "price": [9.99, 24.99, 4.99],
-        "qty": [100, 50, 200],
-    })
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        csv_path = Path(tmpdir) / "products.csv"
-        json_path = Path(tmpdir) / "products.json"
-
-        # Write CSV
-        df.to_csv(csv_path, index=False)
-        print(f"  Wrote CSV to {csv_path.name}")
-        csv_content = csv_path.read_text()
-        print(f"  CSV content:\n{csv_content}")
-
-        # Read CSV back
-        df_csv = pd.read_csv(csv_path)
-        print(f"  Read back {len(df_csv)} rows from CSV")
-
-        # Write JSON (orient='records' gives array-of-objects like JS)
-        df.to_json(json_path, orient="records", indent=2)
-        print(f"  JSON content:\n{json_path.read_text()[:200]}")
-
-        # Read JSON back
-        df_json = pd.read_json(json_path)
-        print(f"  Read back {len(df_json)} rows from JSON")
-
-    return df
-
-
-def demonstrate_adding_and_transforming_columns():
-    """Adding columns, apply, and map — column transformations."""
-    df = pd.DataFrame({
-        "name": ["Alice", "Bob", "Charlie"],
-        "salary": [95000, 82000, 115000],
-        "bonus_pct": [0.10, 0.08, 0.12],
-    })
-
-    # Vectorized column creation (fast)
-    df["total_comp"] = df["salary"] * (1 + df["bonus_pct"])
-    df["tax_bracket"] = np.where(df["salary"] > 90000, "high", "standard")
-    print(f"  With new columns:\n{df}")
-
-    # .apply() — row-wise or column-wise custom function
-    # CAUTION: .apply() is a Python loop under the hood — slower than vectorized
-    df["name_upper"] = df["name"].apply(str.upper)
-    # In JS: arr.map(row => row.name.toUpperCase())
-
-    # .map() — element-wise transform on a Series
-    bracket_labels = {"high": "H", "standard": "S"}
-    df["bracket_code"] = df["tax_bracket"].map(bracket_labels)
-    print(f"\n  After apply & map:\n{df}")
-
-    return df
-
-
-def demonstrate_sorting_and_ranking():
-    """Sorting, ranking, and indexing."""
-    df = pd.DataFrame({
-        "name": ["Alice", "Bob", "Charlie", "Diana"],
-        "score": [88, 95, 72, 95],
-    })
-
-    # Sort by values
-    sorted_df = df.sort_values("score", ascending=False)
-    print(f"  Sorted by score desc:\n{sorted_df}")
-
-    # Rank (handles ties)
-    df["rank"] = df["score"].rank(ascending=False, method="min")
-    print(f"\n  With ranks:\n{df}")
-
-    # Set index
-    indexed = df.set_index("name")
-    print(f"\n  With name as index:\n{indexed}")
-    print(f"  indexed.loc['Alice'] =\n{indexed.loc['Alice']}")
-
-    return df
-
-
-# ══════════════════════════════════════════════════════════════════════
-# SELF-TEST CHALLENGES
-# ══════════════════════════════════════════════════════════════════════
-
-def run_tests():
-    """Automated verification."""
-    print("\n[*] Running automated self-tests...")
-
-    # Test 1: Series creation
-    s = pd.Series([1, 2, 3])
-    assert s.dtype == np.int64, "Default int dtype should be int64"
-    assert len(s) == 3, "Length mismatch"
-
-    # Test 2: DataFrame shape
-    df = pd.DataFrame({"a": [1, 2], "b": [3, 4]})
-    assert df.shape == (2, 2), "Shape should be (2, 2)"
-    assert list(df.columns) == ["a", "b"], "Column names mismatch"
-
-    # Test 3: Boolean filtering
-    df = pd.DataFrame({"val": [10, 20, 30, 40]})
-    filtered = df[df["val"] > 20]
-    assert len(filtered) == 2, "Should have 2 rows > 20"
-    assert list(filtered["val"]) == [30, 40], "Filtered values wrong"
-
-    # Test 4: .loc filtering
-    df = pd.DataFrame({"name": ["A", "B", "C"], "score": [80, 90, 70]})
-    result = df.loc[df["score"] >= 80, "name"]
-    assert list(result) == ["A", "B"], ".loc filtering failed"
-
-    # Test 5: Vectorized column creation
-    df = pd.DataFrame({"price": [10.0, 20.0], "qty": [5, 3]})
-    df["total"] = df["price"] * df["qty"]
-    assert list(df["total"]) == [50.0, 60.0], "Vectorized column failed"
-
-    # Test 6: CSV round-trip
-    df = pd.DataFrame({"x": [1, 2, 3]})
-    with tempfile.TemporaryDirectory() as tmpdir:
-        path = Path(tmpdir) / "test.csv"
-        df.to_csv(path, index=False)
-        df2 = pd.read_csv(path)
-        assert list(df2["x"]) == [1, 2, 3], "CSV round-trip failed"
-
-    # Test 7: Sorting
-    df = pd.DataFrame({"v": [3, 1, 2]})
-    sorted_vals = list(df.sort_values("v")["v"])
-    assert sorted_vals == [1, 2, 3], "Sorting failed"
-
-    # Test 8: .apply()
-    s = pd.Series(["hello", "world"])
-    upper = s.apply(str.upper)
-    assert list(upper) == ["HELLO", "WORLD"], ".apply() failed"
-
-    # Test 9: .map() with dict
-    s = pd.Series(["a", "b", "c"])
-    mapped = s.map({"a": 1, "b": 2, "c": 3})
-    assert list(mapped) == [1, 2, 3], ".map() failed"
-
-    # Test 10: .query() method
-    df = pd.DataFrame({"x": [1, 2, 3, 4], "y": [10, 20, 30, 40]})
-    result = df.query("x > 2")
-    assert len(result) == 2, ".query() filter failed"
-
-    print("[SUCCESS] All 10 Pandas self-tests passed!")
+    print("[SUCCESS] All 5 Pandas DataFrame & Series tests passed cleanly!")
 
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("Phase 9: Pandas DataFrame & Series")
+    print("Phase 9 - 02: Pandas DataFrames, Series & Vectorized Transformations")
     print("=" * 70)
-    print("\n--- Series Basics ---")
-    demonstrate_series_basics()
-    print("\n--- DataFrame Creation ---")
-    demonstrate_dataframe_creation()
-    print("\n--- Selection & Filtering ---")
-    demonstrate_selection_and_filtering()
-    print("\n--- CSV & JSON I/O ---")
-    demonstrate_csv_json_io()
-    print("\n--- Adding & Transforming Columns ---")
-    demonstrate_adding_and_transforming_columns()
-    print("\n--- Sorting & Ranking ---")
-    demonstrate_sorting_and_ranking()
-    print("-" * 70)
     run_tests()
     print("=" * 70)

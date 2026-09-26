@@ -1,379 +1,361 @@
-"""
-Phase 10: Embeddings & Vector Similarity
-================================================================================
-1. CONCEPT & JS/TS ANALOGY:
-   - Concept: Embeddings convert text into dense numerical vectors (arrays of
-     floats) that capture semantic meaning. Similar texts have vectors that
-     are close in vector space. This is the foundation of semantic search,
-     recommendations, and RAG (Retrieval-Augmented Generation).
-   - JS/TS Equivalent: No direct equivalent in JS. You might use TensorFlow.js
-     embeddings, but in production, you call an embedding API (OpenAI, Cohere)
-     and get back a float array. The math (cosine similarity, dot product)
-     is the same in any language.
-   - Key concepts: Embedding dimensions (1536 for text-embedding-3-small,
-     3072 for text-embedding-3-large), cosine similarity (-1 to 1, higher =
-     more similar), Euclidean distance (lower = more similar).
+r"""
+02_embeddings_and_vector_math.py
 
-2. UNDER THE HOOD (CPython & Memory):
-   - Embeddings are NumPy float32 arrays. A 1536-dim embedding is 6KB.
-     Storing 1M embeddings = ~6GB of raw float data.
-   - Cosine similarity: cos(A, B) = (A . B) / (||A|| * ||B||). NumPy
-     computes this in C with BLAS routines — vectorized dot products on
-     contiguous memory. For 1536 dims, this is ~3000 float multiplications.
-   - For batch similarity (query vs N documents), NumPy matrix multiplication
-     `embeddings @ query` computes ALL similarities in one operation — O(N*D)
-     where D is dimension, but executed in optimized C/Fortran BLAS.
+============================================================
+1. CONCEPT
+============================================================
 
-3. COMMON GOTCHA:
-   - Normalizing embeddings: Cosine similarity assumes unit vectors for
-     efficient computation. Many APIs return normalized embeddings, but if
-     yours doesn't, you must normalize first: `v / np.linalg.norm(v)`.
-     Without normalization, dot product != cosine similarity.
-   - Dimensionality matters for storage, not just accuracy. 3072-dim
-     embeddings use 2x the storage and compute of 1536-dim ones.
+Vector embeddings represent the mathematical bridge between human language and machine
+computation. They transform discrete text into continuous dense vectors in high-dimensional
+vector spaces $\mathbb{R}^D$ ($D \in \{384, 768, 1536, 3072\}$):
 
-4. INTERVIEW READINESS: VERBAL RESPONSE SCRIPT
-   - Interview Question: "How do embeddings work and how would you use them
-     for semantic search?"
-   - How to Answer Out Loud (60-90 sec verbal script):
-     * "Embeddings are dense vector representations of text produced by
-       neural networks. Similar texts map to nearby points in vector space."
-     * "For semantic search: I embed all documents at ingestion time and
-       store the vectors. At query time, I embed the user query, then find
-       the K nearest document vectors using cosine similarity."
-     * "Cosine similarity measures the angle between vectors — it's the
-       dot product of normalized vectors, ranging from -1 to 1. I prefer
-       it over Euclidean distance because it's scale-invariant."
-     * "In production, I use a vector database like pgvector or Qdrant for
-       efficient approximate nearest neighbor (ANN) search using HNSW or
-       IVFFlat indexes, which turn O(N) brute-force into O(log N)."
-================================================================================
+1. Vector Similarity Metrics:
+   - Dot Product:
+     $$A \cdot B = \sum_{i=1}^D A_i B_i$$
+     * Scales with vector magnitude. If vectors have identical angles but different lengths,
+       dot product favors longer vectors.
+   - Cosine Similarity:
+     $$\cos(\theta) = \frac{A \cdot B}{\|A\|_2 \|B\|_2} = \frac{\sum A_i B_i}{\sqrt{\sum A_i^2} \sqrt{\sum B_i^2}}$$
+     * Measures the angular difference between vectors, bounded in $[-1.0, 1.0]$.
+     * Scale-invariant: independent of document or token length.
+   - Euclidean Distance ($L_2$ Norm):
+     $$d_2(A, B) = \|A - B\|_2 = \sqrt{\sum_{i=1}^D (A_i - B_i)^2}$$
+     * Geometric distance in Euclidean space ($0 \le d_2 < \infty$).
+   - Manhattan Distance ($L_1$ Norm):
+     $$d_1(A, B) = \sum_{i=1}^D |A_i - B_i|$$
+
+2. The Normalized Unit Vector Identity:
+   - If vectors are normalized to unit length ($\|A\|_2 = 1.0$ and $\|B\|_2 = 1.0$):
+     $$\cos(\theta) = A \cdot B$$
+     $$d_2(A, B)^2 = 2 - 2(A \cdot B) = 2(1 - \cos(\theta))$$
+   - Cosine similarity, dot product, and squared Euclidean distance become strictly monotonic!
+     Sorting by maximum dot product is mathematically equivalent to sorting by minimum Euclidean distance.
+
+3. High-Speed Batch Search via BLAS Matrix Multiplication:
+   - For a query vector $q \in \mathbb{R}^D$ and a document matrix $E \in \mathbb{R}^{N \times D}$:
+     $$S = E \cdot q$$
+   - Using NumPy and optimized BLAS (Basic Linear Algebra Subprograms), computing similarities
+     across 100,000 documents takes under 10 milliseconds on a single CPU core.
+
+
+============================================================
+2. JS / TS ANALOGY
+============================================================
+
++------------------------------+------------------------------------+------------------------------------+
+| Feature                      | Python (NumPy)                     | JavaScript / TypeScript (Node.js)  |
++------------------------------+------------------------------------+------------------------------------+
+| Embedding Buffer             | `np.ndarray(..., dtype=np.float32)`| `Float32Array`                     |
+| Dot Product                  | `np.dot(a, b)` / `a @ b`           | Loop multiplying and accumulating  |
+| Cosine Similarity            | `np.dot(a, b) / (norm(a)*norm(b))` | Custom function using `reduce()`   |
+| Batch Search                 | `scores = matrix @ query`          | Iterating array of `Float32Array`  |
+| Top-K Selection              | `np.argpartition(scores, -k)[-k:]` | Custom heap / `sort()`             |
+| Quantization                 | Native `.astype(np.float16)`       | `Int8Array` manual conversion      |
++------------------------------+------------------------------------+------------------------------------+
+
+Key JS vs Python Architecture Differences:
+1. In Node.js, calculating vector similarities requires looping in JavaScript or using WebAssembly.
+   A single-threaded loop over 100,000 1536-dimensional vectors creates significant garbage collection
+   and latency spikes.
+2. In Python with NumPy, `matrix @ query` dispatches directly to multi-threaded C/Fortran routines
+   (OpenBLAS or MKL) utilizing AVX-512 SIMD instructions, evaluating millions of floating-point
+   operations per millisecond.
+
+
+============================================================
+3. UNDER THE HOOD (Memory Footprint & Quantization)
+============================================================
+
+1. Memory Economics of High-Dimensional Embeddings:
+   - 1 vector ($D = 1536$, `float32`): $1536 \times 4 \text{ bytes} = 6,144 \text{ bytes} \approx 6 \text{ KB}$.
+   - 100,000 vectors: $\approx 600 \text{ MB}$ raw RAM.
+   - 1,000,000 vectors: $\approx 6 \text{ GB}$ raw RAM.
+   - In standard Python lists, each float is boxed into a 24-byte `PyObject`, inflating memory
+     to $> 30 \text{ GB}$. Storing embeddings as contiguous 2D NumPy arrays is mandatory.
+
+2. Vector Quantization (Scalar & Product Quantization):
+   - Scalar Quantization (SQ8): Converts 32-bit floats into 8-bit integers (`int8`), shrinking
+     memory consumption by 75% with negligible recall drop ($< 1\%$).
+   - Binary Quantization: Reduces each dimension to 1 bit (positive vs negative), accelerating
+     similarity search to Hamming distance bitwise `XOR` and `POPCNT` CPU instructions.
+
+
+============================================================
+4. COMMON GOTCHAS
+============================================================
+
+1. Using Dot Product on Non-Normalized Vectors:
+   - When vectors are not normalized to unit length, longer documents or vectors with large
+     magnitudes receive artificially elevated dot products, skewing similarity rankings.
+   - FIX: Always normalize embeddings before computing dot products: `v = v / np.linalg.norm(v)`.
+
+2. The Curse of Dimensionality:
+   - In spaces with thousands of dimensions ($D \ge 1536$), the ratio between the distance to
+     the nearest point and the distance to the farthest point approaches 1 ($d_{\max} \approx d_{\min}$).
+   - Cosine similarity remains robust in high dimensions, whereas Euclidean distance without
+     normalization loses discriminatory power.
+
+3. Sorting Entire Arrays for Top-K ($O(N \log N)$ vs $O(N)$):
+   - Calling `np.argsort(scores)[::-1][:k]` fully sorts all $N$ elements in $O(N \log N)$ time.
+   - FIX: Use `np.argpartition(scores, -k)[-k:]`, which finds the top $K$ elements in linear $O(N)$
+     time, followed by sorting only the top $K$ items.
+
+
+============================================================
+5. INTERVIEW READINESS (VERBAL SCRIPTS)
+============================================================
+
+Q1: "Explain the mathematical relationship between Dot Product, Cosine Similarity, and Euclidean Distance."
+A1: "Cosine similarity measures the cosine of the angle between two vectors, defined as their dot product
+     divided by the product of their L2 norms. Dot product measures both angle and magnitude.
+     When vectors are L2-normalized to unit length ($\|A\| = 1$, $\|B\| = 1$), cosine similarity simplifies
+     directly to the dot product.
+     Furthermore, expanding the squared Euclidean distance between two unit vectors yields:
+     $\|A - B\|^2 = \|A\|^2 + \|B\|^2 - 2(A \cdot B) = 2 - 2(A \cdot B) = 2(1 - \cos(\theta))$.
+     This proves that for normalized vectors, minimizing Euclidean distance is mathematically identical
+     to maximizing cosine similarity. Therefore, in production vector search, we pre-normalize all vectors
+     at ingestion time, allowing us to replace expensive square roots and divisions with lightning-fast
+     dot product matrix multiplications."
+
+Q2: "How would you implement semantic search over 100,000 document chunks using pure NumPy?"
+A2: "I arrange all 100,000 document embeddings into a single 2D NumPy array of shape $(100000, D)$ with
+     `dtype=float32` and pre-normalize each row to unit length using `E = E / np.linalg.norm(E, axis=1, keepdims=True)`.
+     When a search query arrives, I embed and normalize the query vector $q \in \mathbb{R}^D$.
+     I compute the similarity scores for all 100,000 documents simultaneously using a single matrix-vector
+     multiplication: `scores = E @ q`.
+     To extract the top $K$ results efficiently without the $O(N \log N)$ cost of a full sort, I use
+     `np.argpartition(scores, -k)[-k:]` to find the top $K$ indices in $O(N)$ time, sort only those $K$
+     scores, and map the indices back to document metadata."
+
+Q3: "What is vector quantization, and why is it used in production vector databases?"
+A3: "Vector quantization reduces the precision of high-dimensional embedding vectors to dramatically
+     decrease RAM consumption and accelerate nearest-neighbor search.
+     In Scalar Quantization (SQ8), each 32-bit floating-point dimension is mapped onto an 8-bit integer,
+     reducing memory footprint by 75% (from 6KB to 1.5KB per 1536-dim vector) with less than a 1% impact
+     on retrieval accuracy.
+     In Product Quantization (PQ), the vector is split into sub-vectors that are mapped to learned centroid
+     codebooks. This enables databases like pgvector, Qdrant, and Milvus to keep hundreds of millions of
+     vectors resident in RAM or cache, replacing floating-point operations with rapid integer lookups."
 """
 
 import sys
-if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
-    try: sys.stdout.reconfigure(encoding='utf-8')
-    except Exception: pass
+import warnings
+warnings.filterwarnings("ignore")
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from dataclasses import dataclass
+
+# Ensure UTF-8 output encoding across Windows terminals
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 
-# ══════════════════════════════════════════════════════════════════════
-# MOCK EMBEDDING MODEL — Simulates OpenAI's embedding API
-# ══════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# 1. VECTOR SIMILARITY ENGINE
+# ==============================================================================
 
-class MockEmbeddingModel:
+class VectorMath:
+    """Core mathematical operations for high-dimensional vector representations."""
+
+    @staticmethod
+    def l2_normalize(v: np.ndarray) -> np.ndarray:
+        """Normalizes vector or 2D matrix rows to unit Euclidean length (L2 norm = 1.0)."""
+        if v.ndim == 1:
+            norm = np.linalg.norm(v)
+            return v / norm if norm > 0 else v
+        else:
+            norms = np.linalg.norm(v, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            return v / norms
+
+    @staticmethod
+    def dot_product(a: np.ndarray, b: np.ndarray) -> float:
+        """Computes standard dot product: sum(a_i * b_i)."""
+        return float(np.dot(a, b))
+
+    @staticmethod
+    def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+        """Computes cosine similarity: (a . b) / (||a|| * ||b||)."""
+        norm_a = np.linalg.norm(a)
+        norm_b = np.linalg.norm(b)
+        if norm_a == 0.0 or norm_b == 0.0:
+            return 0.0
+        return float(np.dot(a, b) / (norm_a * norm_b))
+
+    @staticmethod
+    def euclidean_distance(a: np.ndarray, b: np.ndarray) -> float:
+        """Computes Euclidean (L2) distance: sqrt(sum((a_i - b_i)^2))."""
+        return float(np.linalg.norm(a - b))
+
+    @staticmethod
+    def manhattan_distance(a: np.ndarray, b: np.ndarray) -> float:
+        """Computes Manhattan (L1) distance: sum(|a_i - b_i|)."""
+        return float(np.sum(np.abs(a - b)))
+
+
+# ==============================================================================
+# 2. IN-MEMORY SEMANTIC SEARCH ENGINE
+# ==============================================================================
+
+class InMemoryVectorIndex:
     """
-    Simulates embedding generation using simple text features.
-
-    REAL CODE (with OpenAI):
-        from openai import OpenAI
-        client = OpenAI()
-        response = client.embeddings.create(
-            model="text-embedding-3-small",
-            input=["Hello world", "Hi there"],
-        )
-        vectors = [item.embedding for item in response.data]
+    High-performance semantic vector index:
+    - Pre-normalizes vectors upon insertion.
+    - Uses BLAS matrix multiplication (E @ q) for sub-millisecond retrieval.
+    - Employs np.argpartition for linear-time O(N) top-K extraction.
     """
 
-    def __init__(self, dimensions: int = 64):
-        self.dimensions = dimensions
-        self._cache: dict[str, np.ndarray] = {}
+    def __init__(self, dimension: int):
+        self.dimension = dimension
+        self.doc_ids: List[str] = []
+        self.doc_texts: List[str] = []
+        self.matrix: Optional[np.ndarray] = None  # Shape: (N, D)
 
-    def embed(self, text: str) -> np.ndarray:
-        """Generate a pseudo-embedding based on text character features."""
-        if text in self._cache:
-            return self._cache[text]
+    def add_documents(self, ids: List[str], texts: List[str], vectors: np.ndarray) -> None:
+        assert vectors.shape[1] == self.dimension, f"Vector dimension must be {self.dimension}"
+        assert len(ids) == len(texts) == len(vectors)
 
-        # Use deterministic hashing for reproducibility
-        np.random.seed(hash(text.lower().strip()) % (2**31))
-        base = np.random.randn(self.dimensions).astype(np.float32)
+        # Pre-normalize vectors to unit length
+        norm_vectors = VectorMath.l2_normalize(vectors)
 
-        # Add semantic-ish features based on simple text analysis
-        words = text.lower().split()
-        word_set = set(words)
+        if self.matrix is None:
+            self.matrix = norm_vectors.astype(np.float32)
+        else:
+            self.matrix = np.vstack([self.matrix, norm_vectors.astype(np.float32)])
 
-        # Nudge similar topics toward similar vectors
-        topic_vectors = {
-            "python": np.array([1, 0.5, 0, 0] + [0] * (self.dimensions - 4), dtype=np.float32),
-            "programming": np.array([0.8, 0.5, 0, 0] + [0] * (self.dimensions - 4), dtype=np.float32),
-            "code": np.array([0.7, 0.4, 0, 0] + [0] * (self.dimensions - 4), dtype=np.float32),
-            "machine": np.array([0, 0, 1, 0.5] + [0] * (self.dimensions - 4), dtype=np.float32),
-            "learning": np.array([0, 0, 0.8, 0.5] + [0] * (self.dimensions - 4), dtype=np.float32),
-            "ai": np.array([0, 0, 0.9, 0.7] + [0] * (self.dimensions - 4), dtype=np.float32),
-            "food": np.array([0, 0, 0, 0, 1, 0.5] + [0] * (self.dimensions - 6), dtype=np.float32),
-            "cooking": np.array([0, 0, 0, 0, 0.8, 0.6] + [0] * (self.dimensions - 6), dtype=np.float32),
-            "weather": np.array([0, 0, 0, 0, 0, 0, 1, 0.5] + [0] * (self.dimensions - 8), dtype=np.float32),
-        }
-        for word, vec in topic_vectors.items():
-            if word in word_set:
-                base += vec * 2.0
+        self.doc_ids.extend(ids)
+        self.doc_texts.extend(texts)
 
-        # Normalize to unit vector (critical for cosine similarity)
-        norm = np.linalg.norm(base)
-        if norm > 0:
-            base = base / norm
+    def search(self, query_vector: np.ndarray, top_k: int = 3) -> List[Dict[str, Any]]:
+        if self.matrix is None or len(self.doc_ids) == 0:
+            return []
 
-        self._cache[text] = base
-        return base
+        # 1. Normalize query vector
+        norm_query = VectorMath.l2_normalize(query_vector).astype(np.float32)
 
-    def embed_batch(self, texts: list[str]) -> np.ndarray:
-        """Embed multiple texts — returns matrix of shape (N, dimensions)."""
-        return np.array([self.embed(t) for t in texts])
+        # 2. Vectorized BLAS matrix-vector dot product (N similarities in 1 operation)
+        similarity_scores = self.matrix @ norm_query  # Shape: (N,)
 
+        # 3. Efficient Top-K via argpartition
+        n_docs = len(self.doc_ids)
+        k = min(top_k, n_docs)
 
-# ── Core Vector Math ─────────────────────────────────────────────────
+        # argpartition moves top k elements to the end in O(N)
+        top_k_indices = np.argpartition(similarity_scores, -k)[-k:]
+        # Sort only the top k items in descending order
+        top_k_indices = top_k_indices[np.argsort(-similarity_scores[top_k_indices])]
 
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """
-    Cosine similarity between two vectors.
-
-    cos(A, B) = (A . B) / (||A|| * ||B||)
-
-    For normalized vectors (||A|| = ||B|| = 1), this simplifies to just
-    the dot product: cos(A, B) = A . B
-    """
-    dot = np.dot(a, b)
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return float(dot / (norm_a * norm_b))
+        results = []
+        for idx in top_k_indices:
+            results.append({
+                "id": self.doc_ids[idx],
+                "text": self.doc_texts[idx],
+                "score": float(similarity_scores[idx])
+            })
+        return results
 
 
-def euclidean_distance(a: np.ndarray, b: np.ndarray) -> float:
-    """
-    Euclidean (L2) distance between two vectors.
-    Lower = more similar. d(A, B) = sqrt(sum((A_i - B_i)^2))
-    """
-    return float(np.linalg.norm(a - b))
+# ==============================================================================
+# 3. SELF-TESTING SUITE
+# ==============================================================================
 
+def run_tests() -> None:
+    print("\n[*] Starting automated test suite for 02_embeddings_and_vector_math.py...")
 
-def dot_product_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Dot product — only meaningful for normalized vectors."""
-    return float(np.dot(a, b))
+    # ------------------------------------------------------------
+    # Test 1: Vector Metric Calculations
+    # ------------------------------------------------------------
+    print("  -> Testing Dot Product, Cosine Similarity, and Euclidean Distance...")
+    v1 = np.array([1.0, 0.0, 0.0])
+    v2 = np.array([0.0, 1.0, 0.0])  # Orthogonal to v1
+    v3 = np.array([2.0, 0.0, 0.0])  # Parallel to v1, double length
 
+    # Orthogonal vectors
+    assert VectorMath.dot_product(v1, v2) == 0.0
+    assert VectorMath.cosine_similarity(v1, v2) == 0.0
+    assert np.isclose(VectorMath.euclidean_distance(v1, v2), np.sqrt(2.0))
+    assert VectorMath.manhattan_distance(v1, v2) == 2.0
 
-# ── Demonstration Functions ──────────────────────────────────────────────
+    # Parallel vectors with different magnitudes
+    assert VectorMath.dot_product(v1, v3) == 2.0
+    assert np.isclose(VectorMath.cosine_similarity(v1, v3), 1.0), "Cosine similarity must be scale invariant"
+    assert VectorMath.euclidean_distance(v1, v3) == 1.0
 
-def demonstrate_embedding_basics():
-    """Creating and inspecting embeddings."""
-    model = MockEmbeddingModel(dimensions=64)
+    # ------------------------------------------------------------
+    # Test 2: Unit Vector Mathematical Identity
+    # ------------------------------------------------------------
+    print("  -> Verifying Normalized Unit Vector Identity: ||u - v||^2 == 2*(1 - cos(theta))...")
+    u_raw = np.array([3.0, 4.0, 0.0])
+    v_raw = np.array([1.0, 1.0, 1.0])
 
-    text = "Python is a great programming language"
-    embedding = model.embed(text)
+    u = VectorMath.l2_normalize(u_raw)
+    v = VectorMath.l2_normalize(v_raw)
 
-    print(f"  Text: '{text}'")
-    print(f"  Embedding shape: {embedding.shape}")
-    print(f"  Embedding dtype: {embedding.dtype}")
-    print(f"  First 8 values: {embedding[:8].round(4)}")
-    print(f"  L2 norm: {np.linalg.norm(embedding):.4f} (should be ~1.0 if normalized)")
+    assert np.isclose(np.linalg.norm(u), 1.0)
+    assert np.isclose(np.linalg.norm(v), 1.0)
 
-    # Batch embedding
-    texts = ["Hello world", "Hi there", "Goodbye"]
-    batch = model.embed_batch(texts)
-    print(f"\n  Batch embedding shape: {batch.shape}")  # (3, 64)
+    # For unit vectors: dot product == cosine similarity
+    dot_sim = VectorMath.dot_product(u, v)
+    cos_sim = VectorMath.cosine_similarity(u, v)
+    assert np.isclose(dot_sim, cos_sim)
 
-    return embedding
+    # Euclidean distance identity
+    euc_dist_sq = VectorMath.euclidean_distance(u, v) ** 2
+    identity_val = 2.0 * (1.0 - cos_sim)
+    assert np.isclose(euc_dist_sq, identity_val, atol=1e-7)
 
+    # ------------------------------------------------------------
+    # Test 3: High-Dimensional Batch Search Engine
+    # ------------------------------------------------------------
+    print("  -> Testing in-memory vector index batch search and top-K ranking...")
+    dim = 8
+    index = InMemoryVectorIndex(dimension=dim)
 
-def demonstrate_similarity_search():
-    """Semantic similarity — the core of vector search."""
-    model = MockEmbeddingModel(dimensions=64)
+    # Create 5 synthetic document vectors
+    doc_vectors = np.array([
+        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],  # Doc 1: Perfect match to query
+        [0.8, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],  # Doc 2: High match
+        [0.0, 0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0],  # Doc 3: Low match
+        [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],  # Doc 4: Orthogonal
+        [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], # Doc 5: Opposing direction
+    ], dtype=np.float32)
 
-    # Corpus of documents
-    documents = [
-        "Python is a great programming language for AI",
-        "JavaScript is used for web development",
-        "Machine learning models use neural networks",
-        "I love cooking Italian food",
-        "The weather today is sunny and warm",
-        "Deep learning is a subset of AI and machine learning",
-        "Python code can be used for data science",
+    doc_ids = ["doc_1", "doc_2", "doc_3", "doc_4", "doc_5"]
+    doc_texts = [
+        "Python FastAPI and async microservices architecture",
+        "Python backend web development with databases",
+        "Frontend React and Vue user interfaces",
+        "DevOps Kubernetes container deployment",
+        "Antagonistic unrelated topic"
     ]
 
-    # Embed all documents
-    doc_embeddings = model.embed_batch(documents)
+    index.add_documents(doc_ids, doc_texts, doc_vectors)
 
-    # Query
-    query = "How to learn Python programming?"
-    query_embedding = model.embed(query)
+    # Query aligned with dimension 0
+    query = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    top_results = index.search(query, top_k=3)
 
-    # Compute similarities
-    similarities = []
-    for i, doc_emb in enumerate(doc_embeddings):
-        sim = cosine_similarity(query_embedding, doc_emb)
-        similarities.append((sim, i, documents[i]))
+    assert len(top_results) == 3
+    # Top 1 must be doc_1 with score 1.0
+    assert top_results[0]["id"] == "doc_1"
+    assert np.isclose(top_results[0]["score"], 1.0)
 
-    # Sort by similarity (descending)
-    similarities.sort(reverse=True)
+    # Top 2 must be doc_2
+    assert top_results[1]["id"] == "doc_2"
+    assert top_results[1]["score"] > 0.9
 
-    print(f"  Query: '{query}'")
-    print(f"  Top results by cosine similarity:")
-    for sim, idx, doc in similarities:
-        marker = " <-- TOP" if sim == similarities[0][0] else ""
-        print(f"    {sim:.4f} | {doc}{marker}")
+    # Score monotonicity
+    assert top_results[0]["score"] >= top_results[1]["score"] >= top_results[2]["score"]
 
-    return similarities
-
-
-def demonstrate_similarity_metrics():
-    """Comparing different similarity/distance metrics."""
-    model = MockEmbeddingModel(dimensions=64)
-
-    pairs = [
-        ("Python programming", "Python code"),
-        ("Python programming", "Machine learning AI"),
-        ("Python programming", "Cooking Italian food"),
-    ]
-
-    print(f"  {'Pair':<45} {'Cosine':>8} {'Euclid':>8} {'Dot':>8}")
-    print(f"  {'-'*45} {'------':>8} {'------':>8} {'------':>8}")
-
-    for text_a, text_b in pairs:
-        a = model.embed(text_a)
-        b = model.embed(text_b)
-        cos = cosine_similarity(a, b)
-        euc = euclidean_distance(a, b)
-        dot = dot_product_similarity(a, b)
-        label = f"'{text_a}' vs '{text_b}'"
-        print(f"  {label:<45} {cos:>8.4f} {euc:>8.4f} {dot:>8.4f}")
-
-    print("\n  Note: For normalized vectors, cosine sim == dot product")
-    print("  Cosine: higher = more similar (range -1 to 1)")
-    print("  Euclidean: lower = more similar (range 0 to inf)")
-
-
-def demonstrate_batch_similarity():
-    """Efficient batch similarity using matrix multiplication."""
-    model = MockEmbeddingModel(dimensions=64)
-
-    documents = [
-        "Python programming language",
-        "Machine learning with Python",
-        "Cooking recipes",
-        "Weather forecast",
-        "Data science tutorial",
-    ]
-    doc_embeddings = model.embed_batch(documents)  # shape: (5, 64)
-    query_embedding = model.embed("Learn Python for AI")  # shape: (64,)
-
-    # Method 1: Loop (slow for large N)
-    loop_sims = [cosine_similarity(query_embedding, d) for d in doc_embeddings]
-
-    # Method 2: Vectorized matrix multiplication (fast!)
-    # For normalized vectors: similarity = embeddings @ query
-    matrix_sims = doc_embeddings @ query_embedding  # shape: (5,)
-
-    print("  Batch similarity via matrix multiply:")
-    for i, (doc, sim) in enumerate(zip(documents, matrix_sims)):
-        print(f"    {sim:.4f} | {doc}")
-
-    # Top-K retrieval
-    top_k = 3
-    top_indices = np.argsort(matrix_sims)[::-1][:top_k]
-    print(f"\n  Top-{top_k} results:")
-    for idx in top_indices:
-        print(f"    [{idx}] {matrix_sims[idx]:.4f} | {documents[idx]}")
-
-    return matrix_sims
-
-
-def demonstrate_embedding_dimensions():
-    """Understanding dimensionality tradeoffs."""
-    print("  === Embedding Model Dimensions ===")
-    print("  text-embedding-3-small (OpenAI):  1536 dims, 6 KB/vector")
-    print("  text-embedding-3-large (OpenAI):  3072 dims, 12 KB/vector")
-    print("  text-embedding-ada-002 (legacy):  1536 dims, 6 KB/vector")
-    print("  all-MiniLM-L6-v2 (Sentence-BERT): 384 dims, 1.5 KB/vector")
-    print()
-
-    # Storage estimation
-    for n_docs, dims in [(10_000, 1536), (100_000, 1536), (1_000_000, 1536)]:
-        size_mb = (n_docs * dims * 4) / (1024 * 1024)  # float32 = 4 bytes
-        print(f"  {n_docs:>10,} docs x {dims} dims = {size_mb:,.0f} MB")
-
-    print()
-    print("  Tradeoffs:")
-    print("  - Higher dims = better accuracy, more storage/compute")
-    print("  - Lower dims = faster search, less RAM, good for prototypes")
-    print("  - Matryoshka embeddings: truncate to fewer dims with minimal loss")
-
-
-# ══════════════════════════════════════════════════════════════════════
-# SELF-TEST CHALLENGES
-# ══════════════════════════════════════════════════════════════════════
-
-def run_tests():
-    """Automated verification."""
-    print("\n[*] Running automated self-tests...")
-
-    model = MockEmbeddingModel(dimensions=64)
-
-    # Test 1: Embedding shape and dtype
-    emb = model.embed("test text")
-    assert emb.shape == (64,), f"Shape should be (64,), got {emb.shape}"
-    assert emb.dtype == np.float32, "Dtype should be float32"
-
-    # Test 2: Embeddings are normalized (unit vectors)
-    norm = np.linalg.norm(emb)
-    assert abs(norm - 1.0) < 0.01, f"Norm should be ~1.0, got {norm:.4f}"
-
-    # Test 3: Same text gives same embedding (deterministic)
-    emb2 = model.embed("test text")
-    assert np.allclose(emb, emb2), "Same text should give same embedding"
-
-    # Test 4: Different text gives different embedding
-    emb3 = model.embed("completely different text")
-    assert not np.allclose(emb, emb3), "Different text should give different embedding"
-
-    # Test 5: Cosine similarity of identical vectors is 1.0
-    sim = cosine_similarity(emb, emb)
-    assert abs(sim - 1.0) < 1e-6, f"Self-similarity should be 1.0, got {sim}"
-
-    # Test 6: Cosine similarity range
-    a = model.embed("Python programming")
-    b = model.embed("Cooking food")
-    sim_ab = cosine_similarity(a, b)
-    assert -1.0 <= sim_ab <= 1.0, f"Cosine sim should be in [-1, 1], got {sim_ab}"
-
-    # Test 7: Euclidean distance of identical vectors is 0
-    dist = euclidean_distance(emb, emb)
-    assert abs(dist) < 1e-6, f"Self-distance should be 0, got {dist}"
-
-    # Test 8: Euclidean distance is non-negative
-    dist_ab = euclidean_distance(a, b)
-    assert dist_ab >= 0, "Distance should be non-negative"
-
-    # Test 9: Batch embedding shape
-    batch = model.embed_batch(["a", "b", "c"])
-    assert batch.shape == (3, 64), f"Batch shape should be (3, 64), got {batch.shape}"
-
-    # Test 10: Matrix similarity matches loop similarity
-    docs = model.embed_batch(["hello", "world", "test"])
-    query = model.embed("hello")
-    matrix_sims = docs @ query
-    loop_sims = np.array([cosine_similarity(query, d) for d in docs])
-    assert np.allclose(matrix_sims, loop_sims, atol=0.01), "Matrix sim should match loop sim"
-
-    print("[SUCCESS] All 10 Embedding self-tests passed!")
+    print("[SUCCESS] All 3 Embeddings & Vector Math tests passed cleanly!")
 
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("Phase 10: Embeddings & Vector Similarity")
+    print("Phase 10 - 02: Dense Embeddings, Vector Math & Semantic Search")
     print("=" * 70)
-    print("\n--- Embedding Basics ---")
-    demonstrate_embedding_basics()
-    print("\n--- Similarity Search ---")
-    demonstrate_similarity_search()
-    print("\n--- Similarity Metrics Comparison ---")
-    demonstrate_similarity_metrics()
-    print("\n--- Batch Similarity (Matrix Multiply) ---")
-    demonstrate_batch_similarity()
-    print("\n--- Embedding Dimensions & Storage ---")
-    demonstrate_embedding_dimensions()
-    print("-" * 70)
     run_tests()
     print("=" * 70)

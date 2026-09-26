@@ -1,318 +1,326 @@
-"""
-Phase 9: NumPy Arrays & Vectorized Operations
-================================================================================
-1. CONCEPT & JS/TS ANALOGY:
-   - Concept: NumPy is THE numerical computing library in Python. Its ndarray
-     is a fixed-type, contiguous-memory array that enables element-wise math
-     WITHOUT Python-level loops — this is called "vectorization."
-   - JS/TS Equivalent: JavaScript's TypedArrays (Float64Array, Int32Array) are
-     the closest analogy — fixed-type, contiguous buffers. But JS has no
-     built-in broadcasting, matrix ops, or slicing. In JS you'd do
-     `arr.map(x => x * 2)` — in NumPy you just write `arr * 2`.
-   - Key difference: NumPy operations are executed in compiled C/Fortran code
-     under the hood, so a vectorized `arr * 2` on 1M elements is 50-100x
-     faster than a Python for-loop doing the same thing.
+r"""
+01_numpy_vectorization.py
 
-2. UNDER THE HOOD (CPython & Memory):
-   - A Python list stores an array of PyObject* pointers — each element can be
-     any type, each is a separately heap-allocated object with refcount.
-   - A NumPy ndarray stores a single contiguous block of raw bytes (dtype).
-     There are NO PyObject wrappers per element. A float64 array of 1M elements
-     is exactly 8MB of contiguous memory, vs a Python list which needs ~28 bytes
-     per float PyObject + 8 bytes per pointer = ~36MB.
-   - Vectorized ops call compiled C loops that iterate over this raw buffer
-     WITHOUT acquiring/releasing the GIL per element. This is why NumPy
-     is "fast" — it's not Python doing the work, it's C.
-   - Broadcasting: When shapes differ, NumPy "broadcasts" the smaller array
-     across the larger one using stride tricks — no actual data copies happen.
+============================================================
+1. CONCEPT
+============================================================
 
-3. COMMON GOTCHA:
-   - NumPy arrays are mutable AND assignment creates a VIEW, not a copy.
-     `b = a[2:5]` makes b a view into a's memory. Mutating b mutates a.
-     This is different from JS `arr.slice(2, 5)` which returns a new array.
-     Use `a[2:5].copy()` to get independent data.
+NumPy (Numerical Python) is the foundational high-performance computing library
+underpinning the entire Python AI and Data Science ecosystem (PyTorch, TensorFlow,
+Pandas, Scikit-Learn, SciPy):
 
-4. 🎙️ INTERVIEW READINESS: VERBAL RESPONSE SCRIPT
-   - Interview Question: "Why is NumPy faster than pure Python for numerical work?"
-   - How to Answer Out Loud (60-90 sec verbal script):
-     * "NumPy stores data in contiguous, fixed-type memory buffers — not as
-       Python objects on the heap. A million float64s is exactly 8MB of raw
-       bytes with zero per-element overhead."
-     * "Vectorized operations dispatch to compiled C/Fortran routines that
-       iterate over this raw buffer without GIL contention per element.
-       So `arr * 2` doesn't create a million Python float objects — it
-       does a tight C loop over 8-byte doubles."
-     * "Broadcasting avoids copies: when you add a scalar to a matrix,
-       NumPy uses stride tricks to virtually replicate the scalar without
-       allocating new memory."
-     * "The tradeoff: NumPy arrays are homogeneous and fixed-type. You can't
-       mix strings and ints like a Python list. And views share memory, so
-       you need to be conscious of when you need .copy()."
-================================================================================
+1. The `ndarray` Data Structure:
+   - An $N$-dimensional, homogeneous, fixed-size memory container.
+   - Key attributes:
+     * `shape`: Tuple of array dimensions (e.g., `(3, 4)` for a 3-row by 4-column matrix).
+     * `dtype`: Explicit low-level machine type (`np.int32`, `np.float32`, `np.float64`).
+     * `strides`: Tuple of bytes to step in each dimension when traversing memory.
+     * `ndim`: Total number of array dimensions.
+     * `nbytes`: Total memory consumed by the raw byte buffer.
+
+2. Vectorization & Universal Functions (ufuncs):
+   - Vectorization: Expressing mathematical operations on entire arrays at once without
+     writing explicit Python `for` loops.
+   - Universal Functions (`ufunc`): Compiled C-level functions that operate element-by-element
+     with hardware-accelerated SIMD (Single Instruction, Multiple Data) CPU vector registers.
+   - Eliminates Python interpreter overhead, dynamic type inspection, and reference counting
+     during iteration.
+
+3. Array Broadcasting Rules:
+   - Allows arithmetic operations between arrays of different shapes without copying data.
+   - Rule of Trailing Alignment: Two shapes are compatible if, starting from the trailing
+     (rightmost) dimension and working backward:
+     1. The dimensions are equal, OR
+     2. One of the dimensions is 1.
+   - Dimensions of size 1 are virtually stretched using zero-stride indexing without allocating
+     additional RAM.
+
+4. Views vs Copies:
+   - Slicing (`arr[1:5]`): Returns a VIEW sharing the same underlying memory buffer.
+     Mutating the view modifies the original array!
+   - Advanced / Fancy Indexing (`arr[[0, 2]]` or boolean masking `arr[arr > 0]`): Always creates
+     a NEW heap-allocated COPY.
+
+
+============================================================
+2. JS / TS ANALOGY
+============================================================
+
++------------------------------+------------------------------------+------------------------------------+
+| Feature                      | Python (NumPy)                     | JavaScript / TypeScript (V8)       |
++------------------------------+------------------------------------+------------------------------------+
+| Typed Buffer                 | `np.ndarray` (multi-dimensional)   | `Float64Array` / `TypedArray` (1D) |
+| Element-wise Math            | `arr * 2 + 5` (vectorized C loop)  | `arr.map(x => x * 2 + 5)` (JS loop)|
+| Multi-Dimensional Shape      | Native shape tuple `(rows, cols)`  | Array of arrays `number[][]`       |
+| Broadcasting                 | Automatic shape alignment          | Manual nested loops                |
+| Slicing Mechanics            | Zero-copy strided view (`arr[1:4]`)| `arr.slice(1, 4)` (allocates copy) |
+| Linear Algebra               | Native matrix operator `A @ B`     | Custom loops or `mathjs` library   |
++------------------------------+------------------------------------+------------------------------------+
+
+Key JS vs Python Architecture Differences:
+1. JavaScript's `TypedArray` (`Float64Array`) provides contiguous memory for 1D arrays, but
+   lacks multi-dimensional strides, broadcasting, and matrix math. In JS, multidimensional tables
+   are modeled as arrays of arrays (`[][]`), which introduces pointer-chasing memory fragmentation.
+2. In JS, `array.slice()` always returns a shallow copy with newly allocated memory. In NumPy,
+   basic slicing returns a view that points directly to the original memory buffer with adjusted
+   strides and offsets.
+
+
+============================================================
+3. UNDER THE HOOD (CPython & Memory Layout)
+============================================================
+
+1. Python List vs NumPy `ndarray` Memory Layout:
+   - Python List: An array of pointers (`PyObject*`). Each integer or float is a boxed heap
+     object with a 16-byte `PyObject_HEAD` (refcount + type pointer) plus value.
+     A list of 1,000,000 64-bit floats requires ~36 MB of memory due to pointer chasing and boxing.
+   - NumPy Array: A single contiguous block of raw C memory bytes.
+     A 1,000,000 float64 array requires exactly $1,000,000 \times 8 \text{ bytes} = 8 \text{ MB}$.
+
+2. Memory Strides & Row-Major Order (C-Contiguous):
+   - For an array with shape `(3, 4)` and `dtype=float64` (8 bytes per item):
+     * `strides = (32, 8)`.
+     * To move down 1 row, advance $4 \times 8 = 32$ bytes.
+     * To move right 1 column, advance $1 \times 8 = 8$ bytes.
+   - Memory address formula: $\text{addr}(i, j) = \text{base} + i \cdot \text{stride}_0 + j \cdot \text{stride}_1$.
+
+3. Hardware Acceleration & GIL Release:
+   - NumPy universal functions are implemented in compiled C and Fortran.
+   - Modern CPUs execute SIMD instructions (AVX-512, AVX2, NEON), computing 4 to 8 double-precision
+     floating-point multiplications simultaneously in a single clock cycle.
+   - NumPy releases the Python GIL during heavy vector calculations, allowing linear algebra
+     libraries (OpenBLAS, Intel MKL) to leverage all available CPU threads in parallel.
+
+
+============================================================
+4. COMMON GOTCHAS
+============================================================
+
+1. Accidental In-Place Mutation via Slicing Views:
+   - Slicing `sub = arr[0:5]` does NOT copy data.
+   - Writing `sub[0] = 999` silently mutates `arr[0]` in the original dataset!
+   - FIX: Explicitly call `.copy()` whenever independent data is required: `sub = arr[0:5].copy()`.
+
+2. The Python List Appending Anti-Pattern:
+   - Trying to grow NumPy arrays inside a loop using `np.append(arr, item)` creates a complete
+     new memory copy on EVERY iteration, degrading performance to $O(N^2)$.
+   - FIX: Pre-allocate the array using `np.zeros(size)` or build a standard Python list and convert
+     once via `np.array(list)`.
+
+3. Axis Orientation Confusion:
+   - `axis=0` operates along dimension 0, collapsing rows (computes column-wise sums/means).
+   - `axis=1` operates along dimension 1, collapsing columns (computes row-wise sums/means).
+
+
+============================================================
+5. INTERVIEW READINESS (VERBAL SCRIPTS)
+============================================================
+
+Q1: "Why is NumPy vectorization 50 to 100 times faster than a standard Python for-loop?"
+A1: "NumPy achieves orders-of-magnitude speedups through three architectural factors:
+     First, Memory Layout: NumPy stores data in raw, contiguous C-buffers without the `PyObject`
+     header overhead or pointer indirection of standard Python lists, enabling optimal CPU L1/L2
+     cache locality.
+     Second, SIMD Parallelism: NumPy ufuncs execute compiled C loops that utilize modern CPU vector
+     registers (such as AVX-512), calculating multiple floating-point operations per clock cycle.
+     Third, Elimination of Dynamic Dispatch: A Python for-loop inspects types and increments/decrements
+     reference counts on every iteration; NumPy executes statically-typed loops entirely in C and
+     releases the GIL for parallel computation."
+
+Q2: "Explain the Broadcasting rules in NumPy and how stride manipulation avoids memory allocation."
+A2: "Broadcasting aligns arrays of differing shapes by evaluating their dimensions from right to left.
+     Two dimensions are compatible if they are equal or if one of them is 1. If a dimension is 1,
+     NumPy virtually stretches that dimension to match the other array.
+     Under the hood, NumPy achieves this using stride tricks: by setting the memory stride for that
+     dimension to 0 bytes, advancing along that dimension repeatedly reads the exact same memory address.
+     This allows operations like adding a 1D vector to a 2D matrix with zero additional memory allocation."
+
+Q3: "What is the difference between a View and a Copy in NumPy, and how can you programmatically verify it?"
+A3: "A View is an array object with its own shape and strides that points to the exact same underlying
+     memory buffer as another array. Basic slicing (`arr[1:5]`) returns a view, meaning mutations to
+     the slice directly alter the original array.
+     A Copy is a brand-new, independent memory allocation. Boolean masking (`arr[arr > 0]`) and fancy
+     indexing (`arr[[0, 2]]`) always return copies.
+     To programmatically verify whether two arrays share memory, we inspect `arr.base` (which returns
+     the root array if it's a view, or `None` if it owns its memory) or call `np.shares_memory(a, b)`."
 """
 
 import sys
-if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
-    try: sys.stdout.reconfigure(encoding='utf-8')
-    except Exception: pass
-
+import time
+import warnings
+warnings.filterwarnings("ignore")
 import numpy as np
 
-
-# ── Demonstration Functions ──────────────────────────────────────────────
-
-def demonstrate_creation_and_dtype():
-    """Array creation, dtypes, and memory layout."""
-    # From a Python list — NumPy infers dtype
-    a = np.array([1, 2, 3, 4, 5])
-    print(f"  Array: {a}, dtype={a.dtype}, shape={a.shape}, ndim={a.ndim}")
-    print(f"  Itemsize: {a.itemsize} bytes, total bytes: {a.nbytes}")
-    # In JS: `new Int64Array([1,2,3,4,5])` — but JS has no int64, only BigInt64Array
-
-    # Explicit dtype
-    floats = np.array([1, 2, 3], dtype=np.float32)
-    print(f"  Float32 array: {floats}, itemsize={floats.itemsize}")
-
-    # Zeros, ones, arange, linspace — factory functions
-    zeros = np.zeros((2, 3))  # 2x3 matrix of 0.0
-    ones = np.ones((3,), dtype=np.int32)
-    rng = np.arange(0, 10, 2)  # Like Python range but returns ndarray
-    lin = np.linspace(0, 1, 5)  # 5 evenly spaced floats in [0, 1]
-    print(f"  zeros shape={zeros.shape}, ones={ones}, arange={rng}")
-    print(f"  linspace(0,1,5) = {lin}")
-
-    # Identity matrix
-    eye = np.eye(3)
-    print(f"  Identity 3x3:\n{eye}")
-
-    return a, floats, zeros
+# Ensure UTF-8 output encoding across Windows terminals
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 
-def demonstrate_vectorization_vs_loop():
-    """Show the power of vectorized operations vs Python loops."""
-    size = 100_000
-    arr = np.arange(size, dtype=np.float64)
+# ==============================================================================
+# 1. DEMONSTRATION & BENCHMARK FUNCTIONS
+# ==============================================================================
 
-    # Vectorized: element-wise operations without loops
-    # In JS you'd write: arr.map(x => x * 2 + 1)
-    result = arr * 2 + 1  # Entire operation in C, no Python loop
+def benchmark_loop_vs_vectorized(n: int = 100_000) -> dict:
+    """
+    Demonstrates empirical performance difference between a pure Python loop
+    and compiled NumPy SIMD vectorization.
+    """
+    py_list = list(range(n))
+    np_arr = np.arange(n, dtype=np.float64)
 
-    # Universal functions (ufuncs) — compiled element-wise operations
-    squares = np.square(arr[:5])
-    sqrts = np.sqrt(arr[1:6])
-    print(f"  arr[:5]         = {arr[:5]}")
-    print(f"  arr[:5] * 2 + 1 = {result[:5]}")
-    print(f"  np.square       = {squares}")
-    print(f"  np.sqrt([1..5]) = {sqrts}")
+    # 1. Pure Python Loop
+    t0 = time.perf_counter()
+    _ = [x * 2.5 + 1.0 for x in py_list]
+    py_time = time.perf_counter() - t0
 
-    # Boolean masking — vectorized filtering (like .filter() in JS)
-    data = np.array([10, 25, 3, 47, 8, 33])
-    mask = data > 15  # Returns array of bools
-    filtered = data[mask]  # Fancy indexing with bool array
-    print(f"  data = {data}")
-    print(f"  mask (>15) = {mask}")
-    print(f"  filtered = {filtered}")
+    # 2. NumPy Vectorized Execution
+    t1 = time.perf_counter()
+    _ = np_arr * 2.5 + 1.0
+    np_time = time.perf_counter() - t1
 
-    return result, filtered
-
-
-def demonstrate_broadcasting():
-    """Broadcasting: how NumPy aligns shapes for operations."""
-    # Scalar broadcast: adds 10 to every element
-    a = np.array([1, 2, 3])
-    print(f"  a + 10 = {a + 10}")
-
-    # 1D + 2D broadcasting
-    matrix = np.array([[1, 2, 3],
-                       [4, 5, 6]])  # shape (2, 3)
-    row = np.array([10, 20, 30])     # shape (3,)
-    # NumPy broadcasts row across each row of matrix
-    result = matrix + row
-    print(f"  matrix + row =\n{result}")
-    # In JS: you'd need a nested loop or lodash
-
-    # Column broadcast — reshape to (3, 1)
-    col = np.array([[100], [200]])  # shape (2, 1)
-    result2 = matrix + col
-    print(f"  matrix + col =\n{result2}")
-
-    return result, result2
+    speedup = py_time / np_time if np_time > 0 else 1.0
+    return {
+        "n_elements": n,
+        "python_loop_sec": py_time,
+        "numpy_vectorized_sec": np_time,
+        "speedup_factor": speedup
+    }
 
 
-def demonstrate_views_vs_copies():
-    """GOTCHA: Slicing creates views, not copies."""
-    original = np.array([10, 20, 30, 40, 50])
+def demonstrate_broadcasting() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Demonstrates zero-copy broadcasting: adding a (3, 1) column vector
+    to a (1, 4) row vector yields a (3, 4) matrix.
+    """
+    col_vector = np.array([[10], [20], [30]])  # shape: (3, 1)
+    row_vector = np.array([[1, 2, 3, 4]])      # shape: (1, 4)
 
-    # Slice creates a VIEW (shared memory)
-    view = original[1:4]
-    view[0] = 999  # This MUTATES original!
-    print(f"  After view mutation: original = {original}")
-    # In JS: arr.slice(1, 4) would create a NEW array
-
-    # Use .copy() for independent data
-    original2 = np.array([10, 20, 30, 40, 50])
-    independent = original2[1:4].copy()
-    independent[0] = 999
-    print(f"  After copy mutation: original2 = {original2}")  # Unchanged
-
-    return original, original2
+    # Broadcasting aligns shapes: (3, 1) + (1, 4) -> (3, 4)
+    result_matrix = col_vector + row_vector
+    return col_vector, row_vector, result_matrix
 
 
-def demonstrate_reshaping_and_stacking():
-    """Reshaping, transposing, and combining arrays."""
-    a = np.arange(12)
-    reshaped = a.reshape(3, 4)  # 3 rows x 4 cols
-    print(f"  arange(12).reshape(3,4) =\n{reshaped}")
-    print(f"  Transposed =\n{reshaped.T}")
+# ==============================================================================
+# 2. SELF-TESTING SUITE
+# ==============================================================================
 
-    # Stacking
-    x = np.array([1, 2, 3])
-    y = np.array([4, 5, 6])
-    vstacked = np.vstack([x, y])  # shape (2, 3)
-    hstacked = np.hstack([x, y])  # shape (6,)
-    print(f"  vstack = {vstacked}")
-    print(f"  hstack = {hstacked}")
+def run_tests() -> None:
+    print("\n[*] Starting automated test suite for 01_numpy_vectorization.py...")
 
-    return reshaped
+    # ------------------------------------------------------------
+    # Test 1: Array Shape, Dtypes & Memory Strides
+    # ------------------------------------------------------------
+    print("  -> Testing ndarray shape, dtype and strided memory layout...")
+    arr = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int32)
+    assert arr.shape == (2, 3)
+    assert arr.dtype == np.int32
+    assert arr.ndim == 2
+    assert arr.itemsize == 4  # 32 bits = 4 bytes
+    assert arr.nbytes == 2 * 3 * 4  # 24 bytes total
+    # C-contiguous strides: move 1 row = 3 items * 4 bytes = 12 bytes; move 1 col = 4 bytes
+    assert arr.strides == (12, 4)
 
+    # ------------------------------------------------------------
+    # Test 2: Vectorization & Arithmetic Operations
+    # ------------------------------------------------------------
+    print("  -> Testing SIMD vectorization and ufunc operations...")
+    data = np.array([1.0, 4.0, 9.0, 16.0], dtype=np.float64)
+    sqrt_res = np.sqrt(data)
+    assert np.allclose(sqrt_res, [1.0, 2.0, 3.0, 4.0])
 
-def demonstrate_aggregations():
-    """Statistical aggregations — the building blocks for data science."""
-    data = np.array([14.2, 19.7, 8.3, 22.1, 15.6, 11.4, 18.9])
+    scaled = data * 2.0 - 1.0
+    assert np.allclose(scaled, [1.0, 7.0, 17.0, 31.0])
 
-    print(f"  mean   = {np.mean(data):.2f}")
-    print(f"  median = {np.median(data):.2f}")
-    print(f"  std    = {np.std(data):.2f}")
-    print(f"  var    = {np.var(data):.2f}")
-    print(f"  min    = {np.min(data):.2f}, argmin = {np.argmin(data)}")
-    print(f"  max    = {np.max(data):.2f}, argmax = {np.argmax(data)}")
-    print(f"  sum    = {np.sum(data):.2f}")
+    # ------------------------------------------------------------
+    # Test 3: Broadcasting Mechanics
+    # ------------------------------------------------------------
+    print("  -> Testing broadcasting dimension alignment rules...")
+    col_v, row_v, broadcast_res = demonstrate_broadcasting()
+    assert broadcast_res.shape == (3, 4)
+    expected_matrix = np.array([
+        [11, 12, 13, 14],
+        [21, 22, 23, 24],
+        [31, 32, 33, 34]
+    ])
+    assert np.array_equal(broadcast_res, expected_matrix)
 
-    # Axis-based aggregation on 2D
-    matrix = np.array([[1, 2, 3],
-                       [4, 5, 6]])
-    print(f"  sum(axis=0) columns = {matrix.sum(axis=0)}")  # [5, 7, 9]
-    print(f"  sum(axis=1) rows    = {matrix.sum(axis=1)}")  # [6, 15]
+    # Incompatible shape broadcasting must raise ValueError
+    a_bad = np.zeros((2, 3))
+    b_bad = np.zeros((2, 4))
+    try:
+        _ = a_bad + b_bad
+        assert False, "Should raise ValueError on incompatible broadcast shapes"
+    except ValueError:
+        pass
 
-    return data
+    # ------------------------------------------------------------
+    # Test 4: Views vs Copies Memory Verification
+    # ------------------------------------------------------------
+    print("  -> Testing View vs Copy memory sharing and mutation...")
+    original = np.array([10, 20, 30, 40, 50], dtype=np.int64)
 
+    # Basic slice creates a VIEW
+    view_slice = original[1:4]
+    assert np.shares_memory(original, view_slice) is True
+    assert view_slice.base is original
 
-def demonstrate_random_and_linear_algebra():
-    """NumPy random generation and basic linear algebra."""
-    rng = np.random.default_rng(seed=42)  # Modern API (not np.random.seed)
+    # Modifying the view modifies the original
+    view_slice[0] = 999
+    assert original[1] == 999, "Mutating view must alter parent array"
 
-    uniform = rng.uniform(0, 1, size=5)
-    normal = rng.normal(loc=0, scale=1, size=5)
-    integers = rng.integers(1, 100, size=5)
-    print(f"  uniform = {uniform}")
-    print(f"  normal  = {normal}")
-    print(f"  integers = {integers}")
+    # Boolean indexing creates a COPY
+    copy_mask = original[original > 50]
+    assert np.shares_memory(original, copy_mask) is False
+    assert copy_mask.base is None
+    copy_mask[0] = 0
+    assert original[1] == 999, "Mutating copy must NOT alter parent array"
 
-    # Dot product & matrix multiplication
-    a = np.array([1, 2, 3])
-    b = np.array([4, 5, 6])
-    dot = np.dot(a, b)  # 1*4 + 2*5 + 3*6 = 32
-    print(f"  dot product = {dot}")
+    # Explicit .copy() creates independent buffer
+    explicit_copy = original.copy()
+    assert np.shares_memory(original, explicit_copy) is False
 
-    # Matrix multiply with @
-    A = np.array([[1, 2], [3, 4]])
-    B = np.array([[5, 6], [7, 8]])
-    C = A @ B
-    print(f"  A @ B =\n{C}")
+    # ------------------------------------------------------------
+    # Test 5: Reductions & Linear Algebra Matrix Multiplication (@)
+    # ------------------------------------------------------------
+    print("  -> Testing reduction axes and matrix dot products...")
+    mat = np.array([
+        [1, 2, 3],
+        [4, 5, 6]
+    ])
+    # axis=0: sum down columns (result shape: (3,))
+    assert np.array_equal(mat.sum(axis=0), [5, 7, 9])
+    # axis=1: sum across rows (result shape: (2,))
+    assert np.array_equal(mat.sum(axis=1), [6, 15])
 
-    return dot, C
+    # Matrix multiplication (@ operator): (2, 3) @ (3, 2) -> (2, 2)
+    mat_b = np.array([
+        [1, 2],
+        [3, 4],
+        [5, 6]
+    ])
+    mat_mult = mat @ mat_b
+    assert mat_mult.shape == (2, 2)
+    # [1*1 + 2*3 + 3*5, 1*2 + 2*4 + 3*6] = [22, 28]
+    # [4*1 + 5*3 + 6*5, 4*2 + 5*4 + 6*6] = [49, 64]
+    assert np.array_equal(mat_mult, [[22, 28], [49, 64]])
 
+    # L2 Euclidean vector norm
+    vec = np.array([3.0, 4.0])
+    l2_norm = np.linalg.norm(vec)
+    assert np.isclose(l2_norm, 5.0)
 
-# ══════════════════════════════════════════════════════════════════════
-# SELF-TEST CHALLENGES
-# ══════════════════════════════════════════════════════════════════════
-
-def run_tests():
-    """Automated verification."""
-    print("\n[*] Running automated self-tests...")
-
-    # Test 1: Dtype and shape
-    a = np.array([1.0, 2.0, 3.0])
-    assert a.dtype == np.float64, "Default float dtype should be float64"
-    assert a.shape == (3,), "Shape mismatch"
-
-    # Test 2: Vectorized arithmetic
-    arr = np.array([10, 20, 30])
-    result = arr * 2 + 5
-    assert np.array_equal(result, np.array([25, 45, 65])), "Vectorized math failed"
-
-    # Test 3: Boolean masking
-    data = np.array([1, 5, 3, 8, 2, 7])
-    filtered = data[data > 4]
-    assert np.array_equal(filtered, np.array([5, 8, 7])), "Boolean mask failed"
-
-    # Test 4: Broadcasting
-    matrix = np.ones((2, 3))
-    row = np.array([1, 2, 3])
-    result = matrix + row
-    expected = np.array([[2, 3, 4], [2, 3, 4]])
-    assert np.array_equal(result, expected), "Broadcasting failed"
-
-    # Test 5: View vs copy
-    orig = np.array([1, 2, 3, 4, 5])
-    view = orig[1:4]
-    view[0] = 99
-    assert orig[1] == 99, "View should mutate original"
-
-    copy = np.array([1, 2, 3, 4, 5])
-    independent = copy[1:4].copy()
-    independent[0] = 99
-    assert copy[1] == 2, "Copy should NOT mutate original"
-
-    # Test 6: Reshape
-    flat = np.arange(6)
-    reshaped = flat.reshape(2, 3)
-    assert reshaped.shape == (2, 3), "Reshape failed"
-    assert reshaped[1, 2] == 5, "Element access after reshape failed"
-
-    # Test 7: Aggregations
-    data = np.array([2.0, 4.0, 6.0, 8.0])
-    assert np.mean(data) == 5.0, "Mean calculation failed"
-    assert np.sum(data) == 20.0, "Sum failed"
-    assert np.min(data) == 2.0, "Min failed"
-    assert np.argmax(data) == 3, "Argmax failed"
-
-    # Test 8: Axis aggregation
-    m = np.array([[1, 2], [3, 4]])
-    assert np.array_equal(m.sum(axis=0), np.array([4, 6])), "Column sum failed"
-    assert np.array_equal(m.sum(axis=1), np.array([3, 7])), "Row sum failed"
-
-    # Test 9: Dot product
-    a = np.array([1, 2, 3])
-    b = np.array([4, 5, 6])
-    assert np.dot(a, b) == 32, "Dot product failed"
-
-    # Test 10: Matrix multiply with @
-    A = np.array([[1, 0], [0, 1]])  # Identity
-    B = np.array([[5, 6], [7, 8]])
-    assert np.array_equal(A @ B, B), "Identity @ B should equal B"
-
-    print("[SUCCESS] All 10 NumPy self-tests passed!")
+    print("[SUCCESS] All 5 NumPy Vectorization & Linear Algebra tests passed cleanly!")
 
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("Phase 9: NumPy Arrays & Vectorized Operations")
+    print("Phase 9 - 01: NumPy ndarrays, Vectorization & Memory Strides")
     print("=" * 70)
-    print("\n--- Array Creation & Dtypes ---")
-    demonstrate_creation_and_dtype()
-    print("\n--- Vectorization vs Loops ---")
-    demonstrate_vectorization_vs_loop()
-    print("\n--- Broadcasting ---")
-    demonstrate_broadcasting()
-    print("\n--- Views vs Copies (GOTCHA) ---")
-    demonstrate_views_vs_copies()
-    print("\n--- Reshaping & Stacking ---")
-    demonstrate_reshaping_and_stacking()
-    print("\n--- Aggregations ---")
-    demonstrate_aggregations()
-    print("\n--- Random & Linear Algebra ---")
-    demonstrate_random_and_linear_algebra()
-    print("-" * 70)
+    bench = benchmark_loop_vs_vectorized(100_000)
+    print(f"  Benchmark (100k items): Python Loop = {bench['python_loop_sec']:.4f}s | "
+          f"NumPy = {bench['numpy_vectorized_sec']:.4f}s | Speedup: {bench['speedup_factor']:.1f}x")
     run_tests()
     print("=" * 70)

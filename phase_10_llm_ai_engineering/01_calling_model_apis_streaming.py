@@ -1,555 +1,497 @@
-"""
-Phase 10: Calling LLM APIs & Streaming Responses
-================================================================================
-1. CONCEPT & JS/TS ANALOGY:
-   - Concept: LLM APIs (OpenAI, Anthropic, Gemini) follow a common pattern:
-     you send messages (system + user + assistant), set parameters (temperature,
-     max_tokens, top_p), and receive generated text. Streaming uses Server-Sent
-     Events (SSE) to deliver tokens incrementally as they're generated.
-   - JS/TS Equivalent: In Node.js you'd use `fetch()` or the official SDK:
-     `openai.chat.completions.create({stream: true})` and iterate over chunks.
-     Python SDKs follow the exact same pattern but use `for chunk in response:`
-     instead of `for await (const chunk of response)`.
-   - Key concepts: Tokens (subword units, ~4 chars), context window (input +
-     output token limit), temperature (0 = deterministic, 1 = creative),
-     top_p (nucleus sampling), stop sequences, system prompts.
+r"""
+01_calling_model_apis_streaming.py
 
-2. UNDER THE HOOD (CPython & Memory):
-   - SDK clients use httpx internally. Streaming responses use HTTP chunked
-     transfer encoding — the server sends `data: {json}\n\n` lines (SSE format).
-   - The Python SDK yields delta objects lazily from a generator. Each chunk
-     is a small dict with `choices[0].delta.content`. Memory usage is O(1)
-     per chunk, not O(total_response), which matters for long outputs.
-   - Non-streaming: the entire response is buffered in memory before returning.
-     For a 4096-token response at ~4 chars/token, that's ~16KB — trivial.
-     Streaming matters for UX (time-to-first-token), not memory.
+============================================================
+1. CONCEPT
+============================================================
 
-3. COMMON GOTCHA:
-   - Forgetting to handle rate limits (429 errors). LLM APIs have strict
-     rate limits (tokens/min, requests/min). You MUST implement exponential
-     backoff. The SDKs have built-in retry, but you should understand it.
-   - Confusing temperature with top_p: setting both high gives unpredictable
-     results. Best practice: adjust one, leave the other at default.
+Large Language Model (LLM) APIs (OpenAI, Anthropic, Google Gemini, Groq, Mistral)
+form the inference foundation of modern AI engineering. Integrating these models into
+production Python backends requires understanding inference parameters, tokenization,
+Server-Sent Events (SSE) streaming, and resilient retry architectures:
 
-4. INTERVIEW READINESS: VERBAL RESPONSE SCRIPT
-   - Interview Question: "How do you integrate an LLM API into a production
-     Python backend?"
-   - How to Answer Out Loud (60-90 sec verbal script):
-     * "I use the official SDK — for OpenAI it's the `openai` package with
-       async support via `AsyncOpenAI`. I configure it with API keys from
-       environment variables, never hardcoded."
-     * "For the API call, I construct a messages array with system, user,
-       and optionally assistant messages for multi-turn context. I set
-       temperature based on the task — 0 for deterministic extraction,
-       0.7 for creative generation."
-     * "In production, I always use streaming for user-facing responses to
-       reduce time-to-first-token. The stream yields delta chunks that I
-       forward via SSE to the frontend. For background processing, I use
-       non-streaming and parse the full response."
-     * "Error handling includes retry with exponential backoff for 429/500
-       errors, timeout configuration, and fallback to a secondary model
-       if the primary is unavailable."
-================================================================================
+1. Unified LLM Request Structure:
+   - Messages Envelope: Ordered sequence of dictionaries containing `role` and `content`:
+     * `system`: Guides persona, instructions, tone, and guardrails.
+     * `user`: The end-user prompt or operational instruction.
+     * `assistant`: Prior model responses (used for multi-turn context).
+     * `tool`: Output from executed functions or API calls.
+   - Inference Hyperparameters:
+     * `temperature`: Softmax logit divisor ($T \in [0.0, 2.0]$). $T = 0.0$ generates
+       deterministic greedy outputs; $T \ge 0.7$ increases diversity.
+     * `top_p` (Nucleus Sampling): Limits candidate tokens to the smallest cumulative
+       probability mass exceeding $P$ ($P \in [0.0, 1.0]$).
+     * `max_tokens`: Enforces hard truncation on generated output tokens.
+     * `stop`: Sequence or list of sequences that immediately halt model generation.
+
+2. Streaming Token Generation via Server-Sent Events (SSE):
+   - Rather than waiting 5-15 seconds for a model to generate hundreds of tokens,
+     streaming delivers tokens incrementally as they are sampled from the transformer.
+   - Uses HTTP chunked transfer encoding (`Content-Type: text/event-stream`).
+   - Drastically reduces Time-To-First-Token (TTFT) from seconds to milliseconds.
+
+3. Context Windows & Token Economics:
+   - Models operate on subword tokens derived via Byte-Pair Encoding (BPE).
+     1 token $\approx$ 4 English characters or 0.75 words.
+   - Total Context Window = $\text{Input Tokens} + \text{Output Tokens}$. Exceeding the window
+     causes immediate API rejection (e.g. `context_length_exceeded`).
+
+4. Resilient Multi-Tier Retry Patterns:
+   - LLM APIs are subject to transient network failures, provider outages (HTTP 500/503),
+     and strict TPM (tokens-per-minute) / RPM (requests-per-minute) rate limits (HTTP 429).
+   - Production systems require exponential backoff with full jitter:
+     $t_{\text{wait}} = \text{random}(0, \min(M, B \cdot 2^{\text{attempt}}))$.
+
+
+============================================================
+2. JS / TS ANALOGY
+============================================================
+
++------------------------------+------------------------------------+------------------------------------+
+| Feature                      | Python (OpenAI SDK / httpx)        | JavaScript / TypeScript (Node.js)  |
++------------------------------+------------------------------------+------------------------------------+
+| Async Client                 | `client = AsyncOpenAI()`           | `const client = new OpenAI()`      |
+| Async Streaming              | `async for chunk in response:`     | `for await (const chunk of stream)`|
+| Event Stream Transport       | Generator yielding typed objects   | `ReadableStream` / EventSource     |
+| Tokenizer                    | `tiktoken` (official Rust/C binding)| `gpt-tokenizer` / `@dqbd/tiktoken`|
+| Backoff & Retries            | `tenacity` decorator / SDK retries | `p-retry` / SDK built-in retries   |
+| Streaming API Response       | Starlette `StreamingResponse`      | Express `res.write()` / Next.js SSE|
++------------------------------+------------------------------------+------------------------------------+
+
+Key JS vs Python Architecture Differences:
+1. In Node.js, `new OpenAI()` is inherently asynchronous and returns Promises. In Python,
+   the `openai` package provides two distinct clients: synchronous `OpenAI()` (blocks OS thread)
+   and asynchronous `AsyncOpenAI()` (runs on the `asyncio` event loop). In FastAPI, always use
+   `AsyncOpenAI` to avoid freezing the event loop.
+2. In TypeScript, streaming involves piping web streams (`ReadableStream`). In Python, the SDK
+   exposes an async generator yielding strongly-typed Pydantic model deltas (`chunk.choices[0].delta.content`),
+   which integrates cleanly with FastAPI's `StreamingResponse`.
+
+
+============================================================
+3. UNDER THE HOOD (Tokenization & Sampling Mathematics)
+============================================================
+
+1. Byte-Pair Encoding (BPE) Tokenization:
+   - LLMs do not see characters, words, or strings; they process sequences of integer token IDs.
+   - BPE starts with individual bytes and iteratively merges the most frequent pairs into single
+     tokens (e.g., `'Ġlearning'` is a single token).
+   - In Python, `tiktoken` executes compiled Rust algorithms capable of tokenizing 1 million tokens/sec.
+
+2. Softmax Temperature & Nucleus Sampling Mathematics:
+   - Given un-normalized model logits $z_i$ over vocabulary $V$:
+     $$P(w_i) = \frac{\exp(z_i / T)}{\sum_{j \in V} \exp(z_j / T)}$$
+   - As $T \to 0$, probabilities for the highest logit approach 1.0 (greedy decoding).
+   - In Top-P sampling, tokens are sorted descending by probability. The model keeps only the
+     top tokens whose cumulative sum satisfies $\sum_{i=1}^k P(w_i) \ge P$, dynamically truncating
+     the tail of improbable tokens.
+
+3. Memory Mechanics of Streaming vs Buffering:
+   - Non-Streaming: The entire response is buffered in memory by the server, serialized to JSON,
+     and transmitted in a single HTTP payload. Memory consumption scales with response length.
+   - Streaming: The server emits SSE chunks (`data: {"choices":[{"delta":{"content":"..."}}]}\n\n`).
+     The client process retains $O(1)$ memory per chunk, streaming tokens directly to downstream
+     sockets or UI interfaces.
+
+
+============================================================
+4. COMMON GOTCHAS
+============================================================
+
+1. Modifying Both Temperature AND Top-P Simultaneously:
+   - Setting both high leads to chaotic distributions; setting both low creates unnatural repetition.
+   - Standard Best Practice: Alter `temperature` OR `top_p`, keeping the other at default (1.0).
+
+2. Hardcoding Context Without Truncation:
+   - Storing all user and assistant turns in an unbounded list guarantees that long conversations
+     will eventually exceed the model's context window (e.g. 128k tokens).
+   - FIX: Implement a sliding context window or summarization strategy that prunes older turns
+     while preserving the system prompt.
+
+3. Blocking the Event Loop with Synchronous SDK Calls:
+   - Calling synchronous `client.chat.completions.create(...)` inside an async FastAPI handler
+     blocks the entire worker process, preventing concurrent request handling.
+   - FIX: Use `await async_client.chat.completions.create(...)`.
+
+
+============================================================
+5. INTERVIEW READINESS (VERBAL SCRIPTS)
+============================================================
+
+Q1: "Explain how you implement token streaming from an LLM API to a frontend client in FastAPI."
+A1: "I instantiate an `AsyncOpenAI` client and invoke `await client.chat.completions.create(..., stream=True)`.
+     This returns an asynchronous generator yielding `ChatCompletionChunk` objects.
+     I wrap this in an async generator function that formats each token chunk into the standard SSE
+     wire protocol: `f'data: {json.dumps({\"token\": content})}\\n\\n'`.
+     In FastAPI, I return a `StreamingResponse` with media type `text/event-stream`. This sets HTTP
+     headers `Transfer-Encoding: chunked` and `Cache-Control: no-cache`, allowing the frontend client
+     to consume tokens via `EventSource` or `fetch()` with reader streams, drastically reducing Time-To-First-Token."
+
+Q2: "What is the difference between Temperature and Top-P (nucleus sampling)?"
+A2: "Temperature modifies the sharpness of the probability distribution across vocabulary logits before
+     sampling. High temperatures flatten the distribution, making less likely tokens more probable and
+     increasing creativity; low temperatures sharpen the distribution toward the top token, approaching
+     deterministic output at temperature 0.
+     Top-P (nucleus sampling) does not alter the logits directly; instead, it dynamically cuts off the
+     tail of the distribution by keeping only the smallest set of top tokens whose cumulative probability
+     equals P (e.g., 0.9). This prevents the model from ever selecting bizarre, low-probability tokens
+     regardless of temperature."
+
+Q3: "How do you handle rate limits and API failures when communicating with LLM providers?"
+A3: "I implement exponential backoff with full jitter and retries for transient errors like HTTP 429
+     (rate limits) and 500/503 (server overloads). I calculate sleep intervals using `random.uniform(0, min(max_backoff, base * 2**attempt))`.
+     For rate limits specifically, I parse the `Retry-After` header if provided by the vendor.
+     In high-availability enterprise systems, I also implement model fallback routing: if primary requests
+     to OpenAI GPT-4o fail after two retries, the service automatically fails over to an alternative provider
+     like Anthropic Claude 3.5 Sonnet or a self-hosted open-weights model on vLLM."
 """
 
 import sys
-if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
-    try: sys.stdout.reconfigure(encoding='utf-8')
-    except Exception: pass
-
-import json
 import time
-import asyncio
+import random
+import json
+import warnings
+warnings.filterwarnings("ignore")
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Iterator
-from enum import Enum
+from typing import Any, AsyncGenerator, Dict, Generator, List, Optional
+
+# Ensure UTF-8 output encoding across Windows terminals
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 
-# ══════════════════════════════════════════════════════════════════════
-# MOCK LLM CLIENT — Simulates the OpenAI/Anthropic SDK interface
-# We mock the API to teach the PATTERNS without requiring API keys.
-# The real SDK call is nearly identical to our mock interface.
-# ══════════════════════════════════════════════════════════════════════
-
-class Role(str, Enum):
-    SYSTEM = "system"
-    USER = "user"
-    ASSISTANT = "assistant"
-
+# ==============================================================================
+# 1. DOMAIN MODELS & SCHEMAS
+# ==============================================================================
 
 @dataclass
-class Message:
-    """Mirrors openai.types.chat.ChatCompletionMessage."""
-    role: str
-    content: str
-
-
-@dataclass
-class Choice:
-    index: int
-    message: Message
-    finish_reason: str = "stop"
-
-
-@dataclass
-class Usage:
+class UsageMetadata:
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
 
 
 @dataclass
-class ChatCompletion:
-    """Mirrors openai.types.chat.ChatCompletion."""
-    id: str
-    model: str
-    choices: list[Choice]
-    usage: Usage
-
-
-@dataclass
-class DeltaContent:
-    content: str = ""
+class ChatDelta:
+    content: Optional[str] = None
+    role: Optional[str] = None
 
 
 @dataclass
 class StreamChoice:
-    index: int
-    delta: DeltaContent
-    finish_reason: str | None = None
+    delta: ChatDelta
+    index: int = 0
+    finish_reason: Optional[str] = None
 
 
 @dataclass
 class ChatCompletionChunk:
-    """Mirrors openai.types.chat.ChatCompletionChunk."""
     id: str
+    choices: List[StreamChoice]
+    created: int
     model: str
-    choices: list[StreamChoice]
 
 
-class MockLLMClient:
-    """
-    Simulates the OpenAI Python SDK interface.
+@dataclass
+class ChatMessage:
+    role: str
+    content: str
 
-    REAL CODE (with actual openai package):
-        from openai import OpenAI
-        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": "Hello!"}],
-            temperature=0.7,
-        )
-        print(response.choices[0].message.content)
-    """
 
-    def __init__(self, model: str = "mock-gpt-4o", api_key: str = "mock-key"):
-        self.model = model
-        self.api_key = api_key
-        self._request_count = 0
+# ==============================================================================
+# 2. TOKEN ESTIMATOR & CONTEXT SLICER
+# ==============================================================================
 
-    def _estimate_tokens(self, text: str) -> int:
-        """Rough token estimation: ~4 chars per token (GPT tokenizer average)."""
+class TokenEstimator:
+    """Estimates subword token counts using BPE heuristic rules (~4 chars/token)."""
+
+    @staticmethod
+    def estimate_tokens(text: str) -> int:
+        if not text:
+            return 0
+        # Heuristic: 1 token ~= 4 characters for English text + punctuation
         return max(1, len(text) // 4)
 
-    def _generate_response(self, messages: list[dict], temperature: float) -> str:
-        """Simulates LLM response generation."""
-        last_msg = messages[-1]["content"] if messages else ""
-        system_msg = next(
-            (m["content"] for m in messages if m["role"] == "system"), ""
-        )
+    @staticmethod
+    def calculate_messages_tokens(messages: List[Dict[str, str]]) -> int:
+        total = 0
+        for msg in messages:
+            # Add message framing overhead (~3 tokens for role/formatting)
+            total += 3 + TokenEstimator.estimate_tokens(msg.get("content", ""))
+        return total + 3  # Add reply primer overhead
 
-        # Simple mock responses based on input
-        if "hello" in last_msg.lower():
-            return "Hello! I'm a mock LLM. How can I help you today?"
-        elif "explain" in last_msg.lower():
-            return ("Sure! Let me explain. LLMs work by predicting the next "
-                    "token in a sequence. They use transformer architecture "
-                    "with attention mechanisms to weigh the relevance of each "
-                    "input token when generating output.")
-        elif "json" in last_msg.lower():
-            return json.dumps({"answer": "Mock structured response", "confidence": 0.95})
-        else:
-            return f"Mock response to: {last_msg[:50]}..."
 
-    def create(
+class ConversationManager:
+    """Manages multi-turn conversation history within hard token budgets."""
+
+    def __init__(self, system_prompt: str, max_context_tokens: int = 4000):
+        self.system_prompt = system_prompt
+        self.max_context_tokens = max_context_tokens
+        self.history: List[Dict[str, str]] = []
+
+    def add_user_message(self, content: str) -> None:
+        self.history.append({"role": "user", "content": content})
+
+    def add_assistant_message(self, content: str) -> None:
+        self.history.append({"role": "assistant", "content": content})
+
+    def get_pruned_messages(self) -> List[Dict[str, str]]:
+        """
+        Returns message list guaranteed to fit within max_context_tokens.
+        Preserves the system prompt, pruning oldest user/assistant turns if needed.
+        """
+        system_msg = {"role": "system", "content": self.system_prompt}
+        sys_tokens = TokenEstimator.calculate_messages_tokens([system_msg])
+
+        available_budget = self.max_context_tokens - sys_tokens
+        if available_budget <= 0:
+            return [system_msg]
+
+        pruned_turns: List[Dict[str, str]] = []
+        current_tokens = 0
+
+        # Traverse history from newest to oldest
+        for msg in reversed(self.history):
+            msg_tokens = TokenEstimator.calculate_messages_tokens([msg])
+            if current_tokens + msg_tokens <= available_budget:
+                pruned_turns.insert(0, msg)
+                current_tokens += msg_tokens
+            else:
+                break  # Context limit reached, drop older turns
+
+        return [system_msg] + pruned_turns
+
+
+# ==============================================================================
+# 3. PRODUCTION MOCK LLM CLIENT (WITH RETRIES & STREAMING)
+# ==============================================================================
+
+class MockLLMProvider:
+    """
+    Simulates production LLM APIs (OpenAI / Anthropic):
+    - Validates parameters (temperature, top_p)
+    - Generates chunked SSE streams
+    - Implements exponential backoff with jitter on simulated 429 errors
+    """
+
+    def __init__(self, simulate_flakiness: bool = False):
+        self.simulate_flakiness = simulate_flakiness
+        self.call_count = 0
+
+    def chat_complete(
         self,
-        messages: list[dict],
-        model: str | None = None,
+        model: str,
+        messages: List[Dict[str, str]],
         temperature: float = 0.7,
-        max_tokens: int = 1024,
         top_p: float = 1.0,
-        stop: list[str] | None = None,
-        stream: bool = False,
-    ) -> ChatCompletion | Iterator[ChatCompletionChunk]:
-        """
-        Mirrors: client.chat.completions.create(...)
+        max_tokens: int = 500,
+        stream: bool = False
+    ) -> Any:
+        if not (0.0 <= temperature <= 2.0):
+            raise ValueError(f"Invalid temperature {temperature}. Must be in [0.0, 2.0].")
+        if not (0.0 <= top_p <= 1.0):
+            raise ValueError(f"Invalid top_p {top_p}. Must be in [0.0, 1.0].")
 
-        Parameters explained:
-        - messages: List of {role, content} dicts. Roles: system, user, assistant.
-        - temperature: 0.0 = deterministic, 1.0 = creative. Controls randomness.
-        - max_tokens: Maximum tokens in the response.
-        - top_p: Nucleus sampling. 0.1 = only top 10% probability mass.
-        - stop: Sequences that halt generation (e.g., ["\n\n"]).
-        - stream: If True, yields chunks incrementally (SSE-like).
-        """
-        self._request_count += 1
-        used_model = model or self.model
-        response_text = self._generate_response(messages, temperature)
+        self.call_count += 1
 
-        if stream:
-            return self._stream_response(response_text, used_model)
-        else:
-            return self._non_stream_response(response_text, messages, used_model)
+        # Simulate transient rate limit failure on first attempt if flakiness enabled
+        if self.simulate_flakiness and self.call_count == 1:
+            raise ConnectionError("HTTP 429: Rate limit exceeded (TPM quota reached).")
 
-    def _non_stream_response(
-        self, text: str, messages: list[dict], model: str
-    ) -> ChatCompletion:
-        prompt_text = " ".join(m["content"] for m in messages)
-        return ChatCompletion(
-            id=f"chatcmpl-mock-{self._request_count}",
-            model=model,
-            choices=[
-                Choice(
-                    index=0,
-                    message=Message(role="assistant", content=text),
-                    finish_reason="stop",
+        # Mock generated response based on last message
+        last_user_content = messages[-1]["content"] if messages else ""
+        synthetic_response = f"AI Analysis of: '{last_user_content}' [Model: {model}]"
+
+        prompt_tokens = TokenEstimator.calculate_messages_tokens(messages)
+        comp_tokens = TokenEstimator.estimate_tokens(synthetic_response)
+
+        if not stream:
+            return {
+                "id": f"chatcmpl-{int(time.time())}",
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": synthetic_response},
+                    "finish_reason": "stop"
+                }],
+                "usage": UsageMetadata(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=comp_tokens,
+                    total_tokens=prompt_tokens + comp_tokens
                 )
-            ],
-            usage=Usage(
-                prompt_tokens=self._estimate_tokens(prompt_text),
-                completion_tokens=self._estimate_tokens(text),
-                total_tokens=self._estimate_tokens(prompt_text) + self._estimate_tokens(text),
-            ),
+            }
+        else:
+            return self._generate_stream_chunks(model, synthetic_response)
+
+    def _generate_stream_chunks(self, model: str, response_text: str) -> Generator[ChatCompletionChunk, None, None]:
+        req_id = f"chatcmpl-stream-{int(time.time())}"
+        words = response_text.split(" ")
+
+        # 1. Initial role chunk
+        yield ChatCompletionChunk(
+            id=req_id,
+            choices=[StreamChoice(delta=ChatDelta(role="assistant"))],
+            created=int(time.time()),
+            model=model
         )
 
-    def _stream_response(
-        self, text: str, model: str
-    ) -> Iterator[ChatCompletionChunk]:
-        """Yields chunks word-by-word, simulating SSE streaming."""
-        words = text.split(" ")
-        for i, word in enumerate(words):
-            content = word + (" " if i < len(words) - 1 else "")
+        # 2. Token content chunks
+        for idx, word in enumerate(words):
+            token_text = word + (" " if idx < len(words) - 1 else "")
             yield ChatCompletionChunk(
-                id=f"chatcmpl-mock-{self._request_count}",
-                model=model,
-                choices=[
-                    StreamChoice(
-                        index=0,
-                        delta=DeltaContent(content=content),
-                        finish_reason=None if i < len(words) - 1 else "stop",
-                    )
-                ],
+                id=req_id,
+                choices=[StreamChoice(delta=ChatDelta(content=token_text))],
+                created=int(time.time()),
+                model=model
             )
 
+        # 3. Final stop chunk
+        yield ChatCompletionChunk(
+            id=req_id,
+            choices=[StreamChoice(delta=ChatDelta(), finish_reason="stop")],
+            created=int(time.time()),
+            model=model
+        )
 
-# ── Demonstration Functions ──────────────────────────────────────────────
 
-def demonstrate_basic_api_call():
-    """Non-streaming completion — the simplest LLM call."""
-    client = MockLLMClient(model="mock-gpt-4o")
+def execute_with_exponential_backoff(
+    provider_fn: Any,
+    max_retries: int = 3,
+    base_delay: float = 0.05
+) -> Any:
+    """Executes provider call with exponential backoff and jitter."""
+    attempt = 0
+    while True:
+        try:
+            return provider_fn()
+        except ConnectionError as err:
+            attempt += 1
+            if attempt > max_retries:
+                raise err
+            # Exponential backoff with jitter
+            backoff = base_delay * (2 ** attempt)
+            jitter = random.uniform(0.01, 0.05)
+            time.sleep(backoff + jitter)
 
-    # The messages array — core of every LLM API call
+
+# ==============================================================================
+# 4. SELF-TESTING SUITE
+# ==============================================================================
+
+def run_tests() -> None:
+    print("\n[*] Starting automated test suite for 01_calling_model_apis_streaming.py...")
+
+    # ------------------------------------------------------------
+    # Test 1: Token Counting & BPE Estimation
+    # ------------------------------------------------------------
+    print("  -> Testing subword token counting heuristics...")
+    sample_text = "Machine learning architectures utilize transformer attention mechanisms."
+    tokens = TokenEstimator.estimate_tokens(sample_text)
+    assert tokens > 0
+    assert tokens == len(sample_text) // 4
+
     messages = [
-        {"role": "system", "content": "You are a helpful coding assistant."},
-        {"role": "user", "content": "Hello, can you help me with Python?"},
+        {"role": "system", "content": "You are a senior AI engineer."},
+        {"role": "user", "content": "Explain self-attention."}
     ]
+    total_tokens = TokenEstimator.calculate_messages_tokens(messages)
+    assert total_tokens > tokens, "Total message tokens must include role and framing overhead"
 
-    response = client.create(
+    # ------------------------------------------------------------
+    # Test 2: Non-Streaming Completion & Usage Tracking
+    # ------------------------------------------------------------
+    print("  -> Testing non-streaming API completion and usage metadata...")
+    provider = MockLLMProvider()
+    resp = provider.chat_complete(
+        model="gpt-4o",
         messages=messages,
-        temperature=0.7,   # Moderate creativity
-        max_tokens=256,     # Limit response length
+        temperature=0.2,
+        top_p=0.9,
+        stream=False
+    )
+    assert resp["model"] == "gpt-4o"
+    assert resp["choices"][0]["message"]["role"] == "assistant"
+    assert "Explain self-attention" in resp["choices"][0]["message"]["content"]
+    assert resp["choices"][0]["finish_reason"] == "stop"
+
+    usage: UsageMetadata = resp["usage"]
+    assert usage.prompt_tokens > 0
+    assert usage.completion_tokens > 0
+    assert usage.total_tokens == (usage.prompt_tokens + usage.completion_tokens)
+
+    # ------------------------------------------------------------
+    # Test 3: SSE Token Streaming & Delta Assembly
+    # ------------------------------------------------------------
+    print("  -> Testing SSE streaming generation and token delta reassembly...")
+    stream_gen = provider.chat_complete(
+        model="gpt-4o",
+        messages=messages,
+        stream=True
+    )
+    chunks = list(stream_gen)
+    assert len(chunks) >= 3, "Stream must yield at least role, content, and stop chunks"
+
+    # Verify first chunk sets role
+    assert chunks[0].choices[0].delta.role == "assistant"
+
+    # Assemble tokens
+    collected_tokens = []
+    for c in chunks:
+        delta_text = c.choices[0].delta.content
+        if delta_text:
+            collected_tokens.append(delta_text)
+
+    assembled_output = "".join(collected_tokens)
+    assert "Explain self-attention" in assembled_output
+
+    # Verify last chunk emits finish_reason="stop"
+    assert chunks[-1].choices[0].finish_reason == "stop"
+
+    # ------------------------------------------------------------
+    # Test 4: Exponential Backoff & Rate Limit Resilience
+    # ------------------------------------------------------------
+    print("  -> Testing exponential backoff retry loop on HTTP 429...")
+    flaky_provider = MockLLMProvider(simulate_flakiness=True)
+
+    # Calling directly without retry would raise ConnectionError
+    # Calling through execute_with_exponential_backoff retries and succeeds on attempt 2
+    res_retry = execute_with_exponential_backoff(
+        lambda: flaky_provider.chat_complete("claude-3-5-sonnet", messages),
+        max_retries=2
+    )
+    assert flaky_provider.call_count == 2
+    assert "claude-3-5-sonnet" in res_retry["choices"][0]["message"]["content"]
+
+    # ------------------------------------------------------------
+    # Test 5: Multi-Turn Conversation History & Pruning
+    # ------------------------------------------------------------
+    print("  -> Testing conversation history management and context window pruning...")
+    conv = ConversationManager(
+        system_prompt="You are a helpful coding assistant.",
+        max_context_tokens=50  # Very tight budget to force pruning
     )
 
-    print(f"  Model: {response.model}")
-    print(f"  Response: {response.choices[0].message.content}")
-    print(f"  Finish reason: {response.choices[0].finish_reason}")
-    print(f"  Usage: {response.usage.prompt_tokens} prompt + "
-          f"{response.usage.completion_tokens} completion = "
-          f"{response.usage.total_tokens} total tokens")
+    conv.add_user_message("Old question 1: How does Python GC work?")
+    conv.add_assistant_message("Old answer 1: Python uses reference counting and cyclic GC.")
+    conv.add_user_message("New question 2: What is asyncio?")
 
-    return response
+    pruned = conv.get_pruned_messages()
+    assert pruned[0]["role"] == "system"
+    assert pruned[0]["content"] == "You are a helpful coding assistant."
+    # The newest turn must be preserved
+    assert pruned[-1]["content"] == "New question 2: What is asyncio?"
+    # The oldest turns must have been pruned due to tight token budget
+    assert len(pruned) < 4
 
-
-def demonstrate_streaming():
-    """Streaming completion — token-by-token delivery for UX."""
-    client = MockLLMClient()
-
-    messages = [
-        {"role": "user", "content": "Explain how LLMs work briefly."},
-    ]
-
-    print("  Streaming response: ", end="", flush=True)
-    full_response = []
-
-    # REAL CODE: for chunk in client.chat.completions.create(..., stream=True):
-    stream = client.create(messages=messages, stream=True)
-    for chunk in stream:
-        delta = chunk.choices[0].delta.content
-        if delta:
-            print(delta, end="", flush=True)
-            full_response.append(delta)
-
-    print()  # newline
-    assembled = "".join(full_response)
-    print(f"  Full assembled response length: {len(assembled)} chars")
-
-    return assembled
-
-
-def demonstrate_multi_turn_conversation():
-    """Multi-turn context — maintaining conversation history."""
-    client = MockLLMClient()
-
-    # Conversation history — the client manages this, not the API
-    conversation: list[dict] = [
-        {"role": "system", "content": "You are a Python tutor."},
-    ]
-
-    # Turn 1
-    conversation.append({"role": "user", "content": "Hello!"})
-    response1 = client.create(messages=conversation)
-    assistant_msg1 = response1.choices[0].message.content
-    conversation.append({"role": "assistant", "content": assistant_msg1})
-    print(f"  Turn 1 - User: Hello!")
-    print(f"  Turn 1 - Assistant: {assistant_msg1}")
-
-    # Turn 2 — includes full history for context
-    conversation.append({"role": "user", "content": "Explain decorators."})
-    response2 = client.create(messages=conversation)
-    assistant_msg2 = response2.choices[0].message.content
-    conversation.append({"role": "assistant", "content": assistant_msg2})
-    print(f"  Turn 2 - User: Explain decorators.")
-    print(f"  Turn 2 - Assistant: {assistant_msg2}")
-
-    # The conversation list now has 5 messages (system + 2 turns)
-    print(f"  Conversation length: {len(conversation)} messages")
-    # In production, you'd trim old messages when approaching context window limit
-
-    return conversation
-
-
-def demonstrate_temperature_and_parameters():
-    """Understanding temperature, top_p, and generation parameters."""
-    client = MockLLMClient()
-
-    print("  === Temperature Effects ===")
-    print("  temperature=0.0 : Deterministic, always same output. Use for:")
-    print("    - Data extraction, classification, code generation")
-    print("  temperature=0.3 : Low creativity. Use for:")
-    print("    - Summarization, factual Q&A")
-    print("  temperature=0.7 : Moderate creativity (DEFAULT). Use for:")
-    print("    - General chat, content writing")
-    print("  temperature=1.0 : High creativity. Use for:")
-    print("    - Brainstorming, creative writing")
-    print()
-    print("  === top_p (Nucleus Sampling) ===")
-    print("  top_p=0.1 : Only consider top 10% probability mass")
-    print("  top_p=1.0 : Consider all tokens (DEFAULT)")
-    print("  Rule: Adjust temperature OR top_p, not both")
-    print()
-    print("  === Token Estimation ===")
-    samples = [
-        "Hello world",
-        "The quick brown fox jumps over the lazy dog",
-        "def fibonacci(n): return n if n < 2 else fibonacci(n-1) + fibonacci(n-2)",
-    ]
-    for text in samples:
-        estimated = client._estimate_tokens(text)
-        print(f"    '{text[:40]}...' ~{estimated} tokens")
-
-
-def demonstrate_error_handling_and_retry():
-    """Production error handling with exponential backoff."""
-
-    class RetryConfig:
-        max_retries: int = 3
-        base_delay: float = 1.0     # seconds
-        max_delay: float = 60.0     # cap
-        retry_on: tuple = (429, 500, 502, 503)
-
-    def call_with_retry(client, messages, config=RetryConfig()):
-        """
-        Exponential backoff retry — production pattern for LLM APIs.
-
-        REAL CODE would use the `tenacity` library:
-            from tenacity import retry, wait_exponential, retry_if_exception_type
-            @retry(wait=wait_exponential(min=1, max=60),
-                   retry=retry_if_exception_type(openai.RateLimitError))
-            def call_llm(messages): ...
-        """
-        last_error = None
-        for attempt in range(config.max_retries + 1):
-            try:
-                response = client.create(messages=messages)
-                return response
-            except Exception as e:
-                last_error = e
-                if attempt < config.max_retries:
-                    delay = min(
-                        config.base_delay * (2 ** attempt),  # 1, 2, 4, 8...
-                        config.max_delay,
-                    )
-                    print(f"    Attempt {attempt + 1} failed: {e}")
-                    print(f"    Retrying in {delay:.1f}s...")
-                    # time.sleep(delay)  # Would actually sleep in production
-        raise last_error  # type: ignore
-
-    client = MockLLMClient()
-    messages = [{"role": "user", "content": "Hello"}]
-    response = call_with_retry(client, messages)
-    print(f"  Retry pattern succeeded: {response.choices[0].message.content}")
-
-    # Key error types in real OpenAI SDK:
-    print("\n  === Common API Errors ===")
-    print("  - RateLimitError (429): Too many requests. Back off exponentially.")
-    print("  - APITimeoutError: Request took too long. Increase timeout or retry.")
-    print("  - AuthenticationError (401): Invalid API key.")
-    print("  - BadRequestError (400): Invalid parameters (e.g., too many tokens).")
-    print("  - InternalServerError (500): Provider issue. Retry or failover.")
-
-    return response
-
-
-def demonstrate_prompt_engineering():
-    """Prompt design patterns for production."""
-    client = MockLLMClient()
-
-    # Pattern 1: System prompt as behavioral guardrails
-    system_prompts = {
-        "extractor": (
-            "You are a data extraction assistant. "
-            "Extract the requested fields from the text. "
-            "Return ONLY valid JSON. No explanations."
-        ),
-        "classifier": (
-            "You are a sentiment classifier. "
-            "Classify the given text as: positive, negative, or neutral. "
-            "Respond with a single word."
-        ),
-        "coder": (
-            "You are a senior Python developer. "
-            "Write clean, typed, PEP 8 code. "
-            "Include docstrings and error handling. "
-            "No explanations unless asked."
-        ),
-    }
-
-    print("  === Prompt Design Patterns ===")
-    for name, prompt in system_prompts.items():
-        print(f"  [{name}] {prompt[:60]}...")
-
-    # Pattern 2: Few-shot prompting
-    few_shot_messages = [
-        {"role": "system", "content": "Classify sentiment as positive/negative/neutral."},
-        {"role": "user", "content": "This product is amazing!"},
-        {"role": "assistant", "content": "positive"},
-        {"role": "user", "content": "Terrible experience, waste of money."},
-        {"role": "assistant", "content": "negative"},
-        # Actual query:
-        {"role": "user", "content": "The food was okay, nothing special."},
-    ]
-    print(f"\n  Few-shot example: {len(few_shot_messages)} messages")
-    print(f"  (2 examples + 1 query = few-shot prompting)")
-
-    # Pattern 3: Prompt injection defense
-    print("\n  === Prompt Injection Defense ===")
-    print("  - Never put user input directly in system prompt")
-    print("  - Use delimiters: 'Analyze the text between <text></text> tags'")
-    print("  - Validate/sanitize user input before inclusion")
-    print("  - Use separate system instructions for guardrails")
-    print("  - Consider output validation (does response match expected schema?)")
-
-    return system_prompts
-
-
-# ══════════════════════════════════════════════════════════════════════
-# SELF-TEST CHALLENGES
-# ══════════════════════════════════════════════════════════════════════
-
-def run_tests():
-    """Automated verification."""
-    print("\n[*] Running automated self-tests...")
-
-    client = MockLLMClient(model="test-model")
-
-    # Test 1: Basic completion returns ChatCompletion
-    messages = [{"role": "user", "content": "Hello"}]
-    response = client.create(messages=messages)
-    assert isinstance(response, ChatCompletion), "Should return ChatCompletion"
-    assert response.model == "test-model", "Model should match"
-
-    # Test 2: Response has correct structure
-    assert len(response.choices) == 1, "Should have 1 choice"
-    assert response.choices[0].message.role == "assistant", "Role should be assistant"
-    assert len(response.choices[0].message.content) > 0, "Content should not be empty"
-    assert response.choices[0].finish_reason == "stop", "Should finish with stop"
-
-    # Test 3: Usage tracking
-    assert response.usage.prompt_tokens > 0, "Should have prompt tokens"
-    assert response.usage.completion_tokens > 0, "Should have completion tokens"
-    assert response.usage.total_tokens == (
-        response.usage.prompt_tokens + response.usage.completion_tokens
-    ), "Total should be sum of prompt + completion"
-
-    # Test 4: Streaming yields chunks
-    stream = client.create(messages=messages, stream=True)
-    chunks = list(stream)
-    assert len(chunks) > 0, "Stream should yield chunks"
-    assert all(isinstance(c, ChatCompletionChunk) for c in chunks), "All should be chunks"
-
-    # Test 5: Streaming assembles to full response
-    full_text = "".join(c.choices[0].delta.content for c in chunks if c.choices[0].delta.content)
-    assert len(full_text) > 0, "Assembled stream should have content"
-
-    # Test 6: Last chunk has finish_reason
-    assert chunks[-1].choices[0].finish_reason == "stop", "Last chunk should be stop"
-
-    # Test 7: System message affects nothing structurally
-    messages_with_system = [
-        {"role": "system", "content": "You are helpful."},
-        {"role": "user", "content": "Hello"},
-    ]
-    response2 = client.create(messages=messages_with_system)
-    assert isinstance(response2, ChatCompletion), "Should work with system message"
-
-    # Test 8: Token estimation
-    assert client._estimate_tokens("Hello world") > 0, "Token estimation should be positive"
-    assert client._estimate_tokens("A" * 100) == 25, "100 chars ~ 25 tokens"
-
-    # Test 9: Multi-turn message list
-    multi_turn = [
-        {"role": "system", "content": "You are a tutor."},
-        {"role": "user", "content": "Hi"},
-        {"role": "assistant", "content": "Hello!"},
-        {"role": "user", "content": "Explain Python"},
-    ]
-    response3 = client.create(messages=multi_turn)
-    assert isinstance(response3, ChatCompletion), "Multi-turn should work"
-
-    # Test 10: Request counting
-    count_before = client._request_count
-    client.create(messages=[{"role": "user", "content": "test"}])
-    assert client._request_count == count_before + 1, "Request counter should increment"
-
-    print("[SUCCESS] All 10 LLM API self-tests passed!")
+    print("[SUCCESS] All 5 Calling LLM APIs & Streaming tests passed cleanly!")
 
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("Phase 10: Calling LLM APIs & Streaming Responses")
+    print("Phase 10 - 01: Calling LLM APIs, SSE Streaming & Rate Limit Retries")
     print("=" * 70)
-    print("\n--- Basic API Call ---")
-    demonstrate_basic_api_call()
-    print("\n--- Streaming ---")
-    demonstrate_streaming()
-    print("\n--- Multi-Turn Conversation ---")
-    demonstrate_multi_turn_conversation()
-    print("\n--- Temperature & Parameters ---")
-    demonstrate_temperature_and_parameters()
-    print("\n--- Error Handling & Retry ---")
-    demonstrate_error_handling_and_retry()
-    print("\n--- Prompt Engineering ---")
-    demonstrate_prompt_engineering()
-    print("-" * 70)
     run_tests()
     print("=" * 70)

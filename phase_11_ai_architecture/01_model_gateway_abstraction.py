@@ -1,424 +1,482 @@
-"""
-Phase 11: Model Gateway & Provider Abstraction
-================================================================================
-1. CONCEPT & JS/TS ANALOGY:
-   - Concept: An AI Model Gateway (or LLM Router) decouples your application
-     logic from individual LLM vendors (OpenAI, Anthropic, Google, Mistral,
-     or self-hosted vLLM). It provides a unified API, intelligent load balancing,
-     automated failover, cost-aware model routing, and token spend tracking.
-   - JS/TS Equivalent: Similar to the Multi-Provider Payment Gateway pattern
-     in Node.js (e.g. abstracting Stripe vs Adyen vs PayPal behind a uniform
-     PaymentService interface), or ORMs abstracting Postgres vs MySQL.
-     In Python AI engineering, libraries like LiteLLM or Portkey implement this,
-     but every production system needs a tailored internal gateway layer.
-   - Key benefits: Zero-downtime model switches, multi-region fallback during
-     outages, routing simple queries to cheap models and complex queries to
-     flagship models, unified cost ledger.
+r"""
+01_model_gateway_abstraction.py
 
-2. UNDER THE HOOD (CPython & Memory):
-   - Gateway acts as an asynchronous facade using Python's Protocol / Abstract
-     Base Classes (`abc.ABC`).
-   - Normalization: Ingests a canonical request structure (e.g. messages list,
-     temperature, max_tokens) and translates it to provider-specific payloads:
-     OpenAI `max_tokens` vs Anthropic `max_tokens_to_sample` vs Google `max_output_tokens`.
-   - Dynamic Dispatch & Async Chain: Evaluates provider health, executes the
-     call via an async client, and if a 429 (Rate Limit) or 503 (Overloaded)
-     occurs, catches the exception and immediately invokes the next provider
-     in the fallback chain without blocking the event loop.
+============================================================
+1. CONCEPT
+============================================================
 
-3. COMMON GOTCHA:
-   - Parameter & Tokenizer Mismatches: Token counts differ wildly between
-     tokenizers (tiktoken for OpenAI vs Claude BPE vs SentencePiece). Never
-     assume 1 token on OpenAI equals 1 token on Claude.
-   - Clamped Temperature Ranges: Anthropic supports temperature in [0.0, 1.0],
-     whereas OpenAI supports [0.0, 2.0]. Sending 1.5 to Anthropic throws an
-     immediate 400 Bad Request unless your gateway normalizes/clamps inputs.
+Enterprise AI backends cannot afford hard vendor lock-in to a single LLM provider (OpenAI,
+Anthropic, Google Gemini, Mistral, Groq, or self-hosted vLLM). An AI Model Gateway
+(or Universal LLM Proxy) decouples application business logic from vendor APIs:
 
-4. 🎙️ INTERVIEW READINESS: VERBAL RESPONSE SCRIPT
-   - Interview Question: "How would you design an enterprise Model Gateway in
-     Python to handle vendor outages and optimize LLM spend?"
-   - How to Answer Out Loud (60-90 sec verbal script):
-     * "I implement a Model Gateway using the Strategy and Chain of Responsibility
-       patterns. At the core is an abstract `ModelProvider` protocol with unified
-       `complete()` and `stream()` methods."
-     * "The gateway sits between our business microservices and external LLMs.
-       When a request arrives, the router checks the task classification:
-       high-volume extraction jobs route to cheap models like GPT-4o-mini or
-       Claude 3.5 Haiku; complex reasoning routes to flagship models."
-     * "For resiliency, I configure a fallback chain: if the primary provider
-       returns a 429, 500, or times out after 8 seconds, the gateway catches the
-       transient error, increments a circuit breaker counter, and seamlessly
-       invokes the secondary provider with the translated prompt."
-     * "Finally, the gateway logs token usage and estimated cost to a centralized
-       Redis/TimescaleDB ledger to enforce per-tenant quotas and budget alerts."
-================================================================================
+1. Canonical Request/Response Abstraction:
+   - Internal microservices communicate exclusively using canonical, vendor-agnostic DTOs
+     (`ModelRequest`, `ModelResponse`, `ModelDelta`).
+   - The Adapter Pattern: Provider-specific adapters translate canonical requests into
+     proprietary vendor HTTP payloads:
+     * OpenAI: Accepts `system` inside the `messages` array; temperature in $[0.0, 2.0]$.
+     * Anthropic: Requires `system` as a distinct top-level API parameter; temperature in $[0.0, 1.0]$.
+     * Gemini: Uses `contents` with `parts` and `generationConfig`.
+
+2. Resiliency & Intelligent Failover Chains:
+   - Chain of Responsibility: Primary Model (GPT-4o) -> Secondary Model (Claude 3.5 Sonnet) -> Fallback (Llama-3.1 on vLLM).
+   - If the primary provider returns HTTP 429 (Rate Limit), 500/503 (Outage), or times out,
+     the gateway intercepts the transient failure and seamlessly dispatches to the secondary
+     provider without bubbling errors to the end-user.
+
+3. Circuit Breaker Concurrency Protection:
+   - Monitors error rates per provider over a sliding window.
+   - States:
+     * `CLOSED`: Normal operation; traffic flows to primary provider.
+     * `OPEN`: Error threshold exceeded; immediately trips and short-circuits traffic to secondary
+       providers without making dead network requests.
+     * `HALF-OPEN`: Recovery timeout expires; canary requests test provider health before resuming full traffic.
+
+4. Cost & Token Governance Ledger:
+   - Tracks exact prompt and completion tokens per tenant/request.
+   - Calculates financial spend using dynamic price tables ($ per 1M tokens), enforcing hard
+     monthly budgetary caps and rate limits.
+
+
+============================================================
+2. JS / TS ANALOGY
+============================================================
+
++------------------------------+------------------------------------+------------------------------------+
+| Feature                      | Python (Model Gateway / LiteLLM)   | JavaScript / TypeScript (Node.js)  |
++------------------------------+------------------------------------+------------------------------------+
+| Provider Abstraction         | `abc.ABC` / `typing.Protocol`      | TypeScript `interface LanguageModel`|
+| Canonical DTOs               | Pydantic v2 `BaseModel`            | Zod schemas / TypeScript types     |
+| Multi-Model SDK              | LiteLLM / Portkey / Custom Gateway | Vercel AI SDK (`@ai-sdk/...`)      |
+| Circuit Breaker              | `pybreaker` / custom async class   | `opossum` npm package              |
+| Async Token Streaming        | Python `async for chunk in gen:`   | Web `ReadableStream` / `for await` |
+| Fallback Pipeline            | Async try/except loop over adapters| `Promise.any` / fallback array loop|
++------------------------------+------------------------------------+------------------------------------+
+
+Key JS vs Python Architecture Differences:
+1. Vercel's AI SDK in TypeScript abstracts models primarily for frontend React Server Components
+   and Next.js edge functions.
+2. In Python, an AI Model Gateway operates as an enterprise infrastructure tier within FastAPI
+   or gRPC services. It manages persistent connection pooling, multi-tenant database billing ledgers,
+   circuit breakers, and streaming transformations with zero serialization overhead.
+
+
+============================================================
+3. UNDER THE HOOD (Async Generators & Wire Translation)
+============================================================
+
+1. Python Async Generator Lifecycle:
+   - The gateway's streaming endpoint returns an `AsyncGenerator[ModelDelta, None]`.
+   - Under CPython, an async generator suspends execution at each `yield` statement without
+     blocking the OS thread or event loop, allowing hundreds of concurrent LLM streams to
+     be processed per worker process.
+
+2. Divergent Wire Protocols & Parameter Normalization:
+   - Temperature Normalization: Passing `temperature=1.5` to Anthropic causes an immediate
+     `400 Bad Request`. The gateway clamps parameters:
+     $$\text{temp}_{\text{anthropic}} = \min(1.0, \max(0.0, \text{temp} / 2.0))$$
+   - System Message Extraction: OpenAI allows multiple `system` messages interleaved throughout
+     the conversation; Anthropic mandates a single top-level `system` string. The gateway parses
+     and concatenates all system roles into the top-level Anthropic parameter.
+
+
+============================================================
+4. COMMON GOTCHAS
+============================================================
+
+1. Retrying Non-Transient 400 Bad Request Errors:
+   - Attempting to fail over on a 400 Bad Request (such as invalid user parameters or prompt
+     injection block) wastes money and latency; secondary providers will reject the same malformed payload!
+   - FIX: Failover ONLY on transient errors: HTTP 429, 500, 502, 503, 504, and network timeouts.
+
+2. Tokenizer Mismatch in Token Budgeting:
+   - Assuming 1000 tokens on OpenAI equals 1000 tokens on Claude. Different tokenizer vocabularies
+     (tiktoken vs Claude BPE) produce different token counts for identical text.
+   - FIX: Always calculate actual costs using provider-reported `usage` metadata from the response.
+
+3. Memory Leaks from Unconsumed Streams:
+   - Abandoning an active async streaming generator without closing it leaves underlying HTTP sockets
+     dangling in the connection pool.
+   - FIX: Wrap streaming iterators in `try...finally` or use context managers.
+
+
+============================================================
+5. INTERVIEW READINESS (VERBAL SCRIPTS)
+============================================================
+
+Q1: "How would you design a resilient, multi-provider AI Model Gateway in Python?"
+A1: "I implement an asynchronous Gateway layer using the Strategy and Chain of Responsibility patterns.
+     At the core, I define an abstract `BaseModelProvider` interface specifying `generate()` and `stream()`
+     methods using canonical Pydantic request/response schemas.
+     I implement concrete provider adapters—such as `OpenAIAdapter` and `AnthropicAdapter`—that handle
+     vendor-specific quirks like extracting top-level system prompts for Claude or clamping temperature ranges.
+     The gateway orchestrates a prioritized fallback chain: when a request arrives, it dispatches to the
+     primary model. If a transient error occurs (such as HTTP 429 rate limits, 503 outages, or socket timeouts),
+     a circuit breaker catches the failure, increments telemetry counters, and immediately routes the prompt
+     to the secondary model without user-visible disruption.
+     Finally, the gateway logs exact token counts and financial costs to a centralized audit ledger."
+
+Q2: "How does the Circuit Breaker pattern protect production systems against LLM provider outages?"
+A2: "A Circuit Breaker operates across three states: `CLOSED`, `OPEN`, and `HALF-OPEN`.
+     Under normal operation (`CLOSED`), all traffic flows to the primary provider. If the provider experiences
+     an outage and consecutive failures exceed our threshold (e.g. 5 errors in 30 seconds), the circuit trips
+     to `OPEN`.
+     While `OPEN`, the gateway immediately routes all incoming requests directly to the secondary provider
+     without waiting for network timeouts against the dead provider, protecting API latency.
+     After a cooldown period (e.g. 60 seconds), the circuit enters `HALF-OPEN` and permits a small canary
+     request through to the primary provider. If the canary succeeds, the circuit resets to `CLOSED`; if it fails,
+     it trips back to `OPEN` for another cooldown cycle."
+
+Q3: "How do you handle schema differences between OpenAI, Anthropic, and Google Gemini in a unified gateway?"
+A3: "I establish a canonical internal contract: `ModelRequest` with fields: `messages: list[Message]`,
+     `temperature: float`, `max_tokens: int`, and `tools: list[Tool]`.
+     In the provider adapters:
+     For Anthropic, I extract all `system` role messages and concatenate them into the top-level `system`
+     parameter, passing only `user` and `assistant` messages in the payload, and clamp temperature to 1.0.
+     For Google Gemini, I convert `messages` into `contents` with `parts` arrays and map roles `user` and `model`.
+     For tool calling, each adapter transforms our standard Pydantic JSON schemas into the provider's expected
+     function declaration format. This guarantees that calling code in our business layer is completely
+     isolated from vendor API changes."
 """
 
 import sys
-if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
-    try: sys.stdout.reconfigure(encoding='utf-8')
-    except Exception: pass
-
-import asyncio
 import time
+import warnings
+warnings.filterwarnings("ignore")
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, AsyncIterator
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+
+# Ensure UTF-8 output encoding across Windows terminals
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 
-# ── Canonical Gateway Domain Models ──────────────────────────────────────────
+# ==============================================================================
+# 1. CANONICAL DATA CONTRACTS (VENDOR-AGNOSTIC)
+# ==============================================================================
 
-class ProviderName(str, Enum):
-    OPENAI = "openai"
-    ANTHROPIC = "anthropic"
-    GEMINI = "gemini"
+class ProviderType(str, Enum):
+    OPENAI = "OPENAI"
+    ANTHROPIC = "ANTHROPIC"
+    GEMINI = "GEMINI"
+    LOCAL_VLLM = "LOCAL_VLLM"
 
 
-@dataclass(frozen=True)
-class GatewayMessage:
-    role: str  # "system", "user", "assistant"
+@dataclass
+class CanonicalMessage:
+    role: str  # 'system', 'user', 'assistant'
     content: str
 
 
 @dataclass
-class GatewayResponse:
-    content: str
-    provider: ProviderName
+class CanonicalRequest:
     model_name: str
+    messages: List[CanonicalMessage]
+    temperature: float = 0.7
+    max_tokens: int = 500
+
+
+@dataclass
+class TokenUsage:
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
-    cost_usd: float
-    latency_ms: float
+    estimated_cost_usd: float
 
 
-class ProviderException(Exception):
-    """Base exception for provider errors."""
-    def __init__(self, provider: ProviderName, message: str, status_code: int = 500):
-        super().__init__(f"[{provider.value}] {status_code}: {message}")
-        self.provider = provider
-        self.status_code = status_code
+@dataclass
+class CanonicalResponse:
+    content: str
+    provider: ProviderType
+    model_used: str
+    usage: TokenUsage
+    latency_sec: float
 
 
-class RateLimitExceededException(ProviderException):
-    """Raised when provider returns HTTP 429."""
-    def __init__(self, provider: ProviderName):
-        super().__init__(provider, "Rate limit exceeded (HTTP 429)", status_code=429)
+# ==============================================================================
+# 2. ABSTRACT PROVIDER ADAPTER & CONCRETE IMPLEMENTATIONS
+# ==============================================================================
 
+class BaseProviderAdapter(ABC):
+    """Abstract interface defining the contract for all LLM vendor adapters."""
 
-# ── Provider Abstract Base Class ─────────────────────────────────────────────
-
-class ModelProvider(ABC):
-    """Abstract Strategy representing an LLM Provider Adapter."""
-
-    def __init__(self, name: ProviderName, cost_per_1k_input: float, cost_per_1k_output: float):
-        self.name = name
-        self.cost_per_1k_input = cost_per_1k_input
-        self.cost_per_1k_output = cost_per_1k_output
-
-    def calculate_cost(self, prompt_tokens: int, completion_tokens: int) -> float:
-        """Unified cost calculation based on token pricing."""
-        input_cost = (prompt_tokens / 1000.0) * self.cost_per_1k_input
-        output_cost = (completion_tokens / 1000.0) * self.cost_per_1k_output
-        return round(input_cost + output_cost, 6)
+    def __init__(self, provider_type: ProviderType, input_cost_per_m: float, output_cost_per_m: float):
+        self.provider_type = provider_type
+        self.input_cost_per_m = input_cost_per_m
+        self.output_cost_per_m = output_cost_per_m
 
     @abstractmethod
-    async def complete(
-        self,
-        messages: list[GatewayMessage],
-        temperature: float = 0.7,
-        max_tokens: int = 1000,
-    ) -> GatewayResponse:
-        """Execute non-streaming completion."""
+    def execute_completion(self, request: CanonicalRequest) -> CanonicalResponse:
         pass
 
+    def calculate_cost(self, prompt_tokens: int, completion_tokens: int) -> float:
+        cost = (prompt_tokens / 1_000_000 * self.input_cost_per_m) + \
+               (completion_tokens / 1_000_000 * self.output_cost_per_m)
+        return round(cost, 6)
 
-# ── Concrete Mock Providers ──────────────────────────────────────────────────
 
-class MockOpenAIProvider(ModelProvider):
-    def __init__(self, should_fail: bool = False):
-        super().__init__(ProviderName.OPENAI, cost_per_1k_input=0.005, cost_per_1k_output=0.015)
-        self.should_fail = should_fail
+class MockOpenAIAdapter(BaseProviderAdapter):
+    """Adapter for OpenAI API (temperature [0.0, 2.0], system in messages)."""
+
+    def __init__(self, simulate_outage: bool = False):
+        super().__init__(ProviderType.OPENAI, input_cost_per_m=2.50, output_cost_per_m=10.00)
+        self.simulate_outage = simulate_outage
         self.call_count = 0
 
-    async def complete(
-        self,
-        messages: list[GatewayMessage],
-        temperature: float = 0.7,
-        max_tokens: int = 1000,
-    ) -> GatewayResponse:
+    def execute_completion(self, request: CanonicalRequest) -> CanonicalResponse:
         self.call_count += 1
+        if self.simulate_outage:
+            raise ConnectionError("HTTP 503: OpenAI API server overloaded.")
+
         t0 = time.perf_counter()
-        await asyncio.sleep(0.01)  # Simulate network hop
+        # Normalization: OpenAI accepts temperature up to 2.0
+        normalized_temp = max(0.0, min(2.0, request.temperature))
 
-        if self.should_fail:
-            raise RateLimitExceededException(self.name)
+        last_user = next((m.content for m in reversed(request.messages) if m.role == "user"), "")
+        content = f"OpenAI ({request.model_name}) response to: '{last_user}' [temp={normalized_temp}]"
 
-        # Normalize temperature: OpenAI supports [0.0, 2.0]
-        clamped_temp = max(0.0, min(temperature, 2.0))
-        prompt_text = " ".join(m.content for m in messages)
-        p_tokens = len(prompt_text.split()) * 2
-        c_tokens = 35
+        p_tokens = sum(len(m.content) // 4 for m in request.messages) + 5
+        c_tokens = len(content) // 4
+        cost = self.calculate_cost(p_tokens, c_tokens)
 
-        latency = (time.perf_counter() - t0) * 1000.0
-        return GatewayResponse(
-            content=f"[OpenAI gpt-4o response at temp {clamped_temp:.1f}]: Answer to '{messages[-1].content}'",
-            provider=self.name,
-            model_name="gpt-4o",
-            prompt_tokens=p_tokens,
-            completion_tokens=c_tokens,
-            total_tokens=p_tokens + c_tokens,
-            cost_usd=self.calculate_cost(p_tokens, c_tokens),
-            latency_ms=round(latency, 2),
+        return CanonicalResponse(
+            content=content,
+            provider=self.provider_type,
+            model_used=request.model_name,
+            usage=TokenUsage(p_tokens, c_tokens, p_tokens + c_tokens, cost),
+            latency_sec=time.perf_counter() - t0
         )
 
 
-class MockAnthropicProvider(ModelProvider):
-    def __init__(self, should_fail: bool = False):
-        super().__init__(ProviderName.ANTHROPIC, cost_per_1k_input=0.003, cost_per_1k_output=0.015)
-        self.should_fail = should_fail
-        self.call_count = 0
+class MockAnthropicAdapter(BaseProviderAdapter):
+    """Adapter for Anthropic API (temperature [0.0, 1.0], system extracted as top-level param)."""
 
-    async def complete(
-        self,
-        messages: list[GatewayMessage],
-        temperature: float = 0.7,
-        max_tokens: int = 1000,
-    ) -> GatewayResponse:
-        self.call_count += 1
-        t0 = time.perf_counter()
-        await asyncio.sleep(0.01)
-
-        if self.should_fail:
-            raise ProviderException(self.name, "Service Unavailable (HTTP 503)", 503)
-
-        # Gotcha fix: Anthropic temperature is strictly in [0.0, 1.0]
-        clamped_temp = max(0.0, min(temperature, 1.0))
-        prompt_text = " ".join(m.content for m in messages)
-        p_tokens = int(len(prompt_text.split()) * 1.8)
-        c_tokens = 40
-
-        latency = (time.perf_counter() - t0) * 1000.0
-        return GatewayResponse(
-            content=f"[Anthropic Claude 3.5 Sonnet at temp {clamped_temp:.1f}]: Answer to '{messages[-1].content}'",
-            provider=self.name,
-            model_name="claude-3-5-sonnet",
-            prompt_tokens=p_tokens,
-            completion_tokens=c_tokens,
-            total_tokens=p_tokens + c_tokens,
-            cost_usd=self.calculate_cost(p_tokens, c_tokens),
-            latency_ms=round(latency, 2),
-        )
-
-
-class MockGeminiProvider(ModelProvider):
     def __init__(self):
-        super().__init__(ProviderName.GEMINI, cost_per_1k_input=0.00125, cost_per_1k_output=0.005)
+        super().__init__(ProviderType.ANTHROPIC, input_cost_per_m=3.00, output_cost_per_m=15.00)
         self.call_count = 0
 
-    async def complete(
-        self,
-        messages: list[GatewayMessage],
-        temperature: float = 0.7,
-        max_tokens: int = 1000,
-    ) -> GatewayResponse:
+    def execute_completion(self, request: CanonicalRequest) -> CanonicalResponse:
         self.call_count += 1
         t0 = time.perf_counter()
-        await asyncio.sleep(0.01)
 
-        p_tokens = len(" ".join(m.content for m in messages).split()) * 2
-        c_tokens = 45
-        latency = (time.perf_counter() - t0) * 1000.0
+        # Normalization 1: Anthropic strictly bounds temperature in [0.0, 1.0]
+        clamped_temp = max(0.0, min(1.0, request.temperature / 2.0 if request.temperature > 1.0 else request.temperature))
 
-        return GatewayResponse(
-            content=f"[Google Gemini 1.5 Pro]: Answer to '{messages[-1].content}'",
-            provider=self.name,
-            model_name="gemini-1.5-pro",
-            prompt_tokens=p_tokens,
-            completion_tokens=c_tokens,
-            total_tokens=p_tokens + c_tokens,
-            cost_usd=self.calculate_cost(p_tokens, c_tokens),
-            latency_ms=round(latency, 2),
+        # Normalization 2: Extract system prompt into top-level parameter
+        system_prompts = [m.content for m in request.messages if m.role == "system"]
+        top_level_system = "\n\n".join(system_prompts)
+
+        last_user = next((m.content for m in reversed(request.messages) if m.role == "user"), "")
+        content = f"Anthropic ({request.model_name}) response to: '{last_user}' [system='{top_level_system[:50]}...']"
+
+        p_tokens = sum(len(m.content) // 4 for m in request.messages) + 8
+        c_tokens = len(content) // 4
+        cost = self.calculate_cost(p_tokens, c_tokens)
+
+        return CanonicalResponse(
+            content=content,
+            provider=self.provider_type,
+            model_used=request.model_name,
+            usage=TokenUsage(p_tokens, c_tokens, p_tokens + c_tokens, cost),
+            latency_sec=time.perf_counter() - t0
         )
 
 
-# ── The Model Gateway Orchestrator ───────────────────────────────────────────
+# ==============================================================================
+# 3. CIRCUIT BREAKER ENGINE
+# ==============================================================================
+
+class CircuitState(str, Enum):
+    CLOSED = "CLOSED"      # Normal operation
+    OPEN = "OPEN"          # Provider down, reject requests
+    HALF_OPEN = "HALF_OPEN"# Testing canary
+
+
+class CircuitBreaker:
+    """Monitors provider failure rates and prevents cascading timeouts."""
+
+    def __init__(self, failure_threshold: int = 2, recovery_cooldown_sec: float = 0.5):
+        self.failure_threshold = failure_threshold
+        self.recovery_cooldown = recovery_cooldown_sec
+        self.state = CircuitState.CLOSED
+        self.consecutive_failures = 0
+        self.last_failure_time = 0.0
+
+    def record_success(self) -> None:
+        self.consecutive_failures = 0
+        self.state = CircuitState.CLOSED
+
+    def record_failure(self) -> None:
+        self.consecutive_failures += 1
+        self.last_failure_time = time.time()
+        if self.consecutive_failures >= self.failure_threshold:
+            self.state = CircuitState.OPEN
+
+    def can_attempt(self) -> bool:
+        if self.state == CircuitState.CLOSED:
+            return True
+        if self.state == CircuitState.OPEN:
+            # Check if cooldown has elapsed to enter HALF-OPEN
+            if time.time() - self.last_failure_time >= self.recovery_cooldown:
+                self.state = CircuitState.HALF_OPEN
+                return True
+            return False
+        if self.state == CircuitState.HALF_OPEN:
+            return True
+        return False
+
+
+# ==============================================================================
+# 4. RESILIENT MODEL GATEWAY (ROUTER & FAILOVER CHAIN)
+# ==============================================================================
 
 class ModelGateway:
     """
-    Enterprise LLM Router with:
-    1. Primary-to-Secondary Fallback Chain
-    2. Cost and Token Metrics Aggregation
-    3. Circuit breaker awareness
+    Enterprise Model Gateway with:
+    - Primary and fallback provider chains
+    - Circuit breaker protection
+    - Parameter normalization
+    - Centralized cost and token auditing
     """
 
-    def __init__(self, fallback_chain: list[ModelProvider]):
-        if not fallback_chain:
-            raise ValueError("Fallback chain must have at least one provider.")
-        self.fallback_chain = fallback_chain
+    def __init__(self, providers: List[BaseProviderAdapter]):
+        assert len(providers) > 0, "Gateway must have at least one provider"
+        self.providers = providers
+        self.circuit_breakers: Dict[ProviderType, CircuitBreaker] = {
+            p.provider_type: CircuitBreaker() for p in providers
+        }
+        self.total_tokens_routed = 0
         self.total_spend_usd = 0.0
-        self.total_tokens_consumed = 0
-        self.failed_provider_attempts: dict[str, int] = {}
 
-    async def execute_with_fallback(
-        self,
-        messages: list[GatewayMessage],
-        temperature: float = 0.7,
-        max_tokens: int = 1000,
-    ) -> GatewayResponse:
-        """Executes completion with automated fallback along the chain."""
-        errors: list[str] = []
+    def complete(self, request: CanonicalRequest) -> CanonicalResponse:
+        errors: List[str] = []
 
-        for provider in self.fallback_chain:
-            try:
-                resp = await provider.complete(
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                # On success: accumulate metrics
-                self.total_spend_usd += resp.cost_usd
-                self.total_tokens_consumed += resp.total_tokens
-                return resp
-            except ProviderException as ex:
-                provider_key = provider.name.value
-                self.failed_provider_attempts[provider_key] = (
-                    self.failed_provider_attempts.get(provider_key, 0) + 1
-                )
-                errors.append(str(ex))
-                print(f"  [GATEWAY WARNING] Provider {provider_key} failed ({ex}). Falling back...")
+        # Traverse fallback chain
+        for adapter in self.providers:
+            ptype = adapter.provider_type
+            breaker = self.circuit_breakers[ptype]
+
+            if not breaker.can_attempt():
+                errors.append(f"[{ptype.value}] Circuit Breaker is OPEN (skipped).")
                 continue
 
-        raise RuntimeError(f"All providers in fallback chain failed! Details: {errors}")
+            try:
+                response = adapter.execute_completion(request)
+                breaker.record_success()
+
+                # Audit metrics
+                self.total_tokens_routed += response.usage.total_tokens
+                self.total_spend_usd += response.usage.estimated_cost_usd
+
+                return response
+            except Exception as e:
+                breaker.record_failure()
+                errors.append(f"[{ptype.value}] Failed: {str(e)}")
+
+        raise RuntimeError(f"All Model Gateway providers exhausted: {'; '.join(errors)}")
 
 
-# ── Demonstration Functions ──────────────────────────────────────────────────
+# ==============================================================================
+# 5. SELF-TESTING SUITE
+# ==============================================================================
 
-async def demonstrate_gateway_happy_path():
-    """Demonstrates successful call using primary provider."""
-    print("  --- Demonstration 1: Gateway Normal Flow ---")
-    p1 = MockOpenAIProvider(should_fail=False)
-    p2 = MockAnthropicProvider(should_fail=False)
-    gateway = ModelGateway(fallback_chain=[p1, p2])
+def run_tests() -> None:
+    print("\n[*] Starting automated test suite for 01_model_gateway_abstraction.py...")
 
-    msgs = [
-        GatewayMessage(role="system", content="You are a senior enterprise architect."),
-        GatewayMessage(role="user", content="Design a resilient LLM gateway."),
-    ]
-    resp = await gateway.execute_with_fallback(msgs, temperature=0.7)
-    print(f"    Resolved by Provider: {resp.provider.value} (Model: {resp.model_name})")
-    print(f"    Content: {resp.content}")
-    print(f"    Tokens: {resp.total_tokens} | Cost: ${resp.cost_usd:.6f} | Latency: {resp.latency_ms}ms")
-    return resp
+    req = CanonicalRequest(
+        model_name="flagship-chat",
+        messages=[
+            CanonicalMessage(role="system", content="You are an enterprise code assistant."),
+            CanonicalMessage(role="user", content="How do you architect a model router in Python?")
+        ],
+        temperature=1.6,  # Valid for OpenAI, requires clamping for Anthropic
+        max_tokens=400
+    )
 
+    # ------------------------------------------------------------
+    # Test 1: Provider Normalization (Temperature Clamping & System Prompt)
+    # ------------------------------------------------------------
+    print("  -> Testing parameter normalization across OpenAI and Anthropic adapters...")
+    openai_adapter = MockOpenAIAdapter(simulate_outage=False)
+    anthropic_adapter = MockAnthropicAdapter()
 
-async def demonstrate_gateway_automatic_failover():
-    """Demonstrates failover when primary throws 429."""
-    print("\n  --- Demonstration 2: Gateway Automatic Failover ---")
-    p1 = MockOpenAIProvider(should_fail=True)      # Simulating 429
-    p2 = MockAnthropicProvider(should_fail=False)  # Resilient fallback
-    p3 = MockGeminiProvider()
-    gateway = ModelGateway(fallback_chain=[p1, p2, p3])
+    res_openai = openai_adapter.execute_completion(req)
+    assert res_openai.provider == ProviderType.OPENAI
+    assert "temp=1.6" in res_openai.content
 
-    msgs = [GatewayMessage(role="user", content="Summarize quarterly system uptime.")]
-    resp = await gateway.execute_with_fallback(msgs)
+    res_anthropic = anthropic_adapter.execute_completion(req)
+    assert res_anthropic.provider == ProviderType.ANTHROPIC
+    assert "system='You are an enterprise" in res_anthropic.content
+    assert res_anthropic.usage.estimated_cost_usd > 0.0
 
-    print(f"    Fallback Success: Handled by {resp.provider.value} ({resp.model_name})")
-    print(f"    OpenAI call count: {p1.call_count} (Failed)")
-    print(f"    Anthropic call count: {p2.call_count} (Recovered)")
-    print(f"    Total Gateway Spend: ${gateway.total_spend_usd:.6f}")
-    return resp
+    # ------------------------------------------------------------
+    # Test 2: Resilient Failover Chain (Primary -> Secondary)
+    # ------------------------------------------------------------
+    print("  -> Testing automatic failover when primary provider experiences outage...")
+    # Primary OpenAI is simulated as DOWN (503), Secondary Anthropic is UP
+    failing_openai = MockOpenAIAdapter(simulate_outage=True)
+    working_anthropic = MockAnthropicAdapter()
 
+    gateway = ModelGateway(providers=[failing_openai, working_anthropic])
 
-# ══════════════════════════════════════════════════════════════════════
-# SELF-TEST CHALLENGES
-# ══════════════════════════════════════════════════════════════════════
+    # Gateway should catch OpenAI failure and seamlessly route to Anthropic
+    failover_response = gateway.complete(req)
+    assert failover_response.provider == ProviderType.ANTHROPIC, "Gateway failed to route to secondary provider"
+    assert "Anthropic" in failover_response.content
+    assert gateway.total_tokens_routed > 0
+    assert gateway.total_spend_usd > 0.0
 
-def run_tests():
-    """Automated verification for Phase 11 File 1."""
-    print("\n[*] Running automated self-tests...")
+    # ------------------------------------------------------------
+    # Test 3: Circuit Breaker State Transitions
+    # ------------------------------------------------------------
+    print("  -> Testing Circuit Breaker state transitions (CLOSED -> OPEN -> HALF-OPEN)...")
+    cb = CircuitBreaker(failure_threshold=2, recovery_cooldown_sec=0.1)
+    assert cb.state == CircuitState.CLOSED
+    assert cb.can_attempt() is True
 
-    async def _test_runner():
-        # Test 1: Provider cost calculation
-        p_ai = MockOpenAIProvider()
-        cost = p_ai.calculate_cost(prompt_tokens=1000, completion_tokens=1000)
-        assert abs(cost - 0.020) < 1e-5, f"Cost expected 0.020, got {cost}"
+    # First failure
+    cb.record_failure()
+    assert cb.state == CircuitState.CLOSED
 
-        # Test 2: Primary provider success
-        p_ant = MockAnthropicProvider()
-        gateway = ModelGateway([p_ai, p_ant])
-        msgs = [GatewayMessage("user", "Hello")]
-        resp = await gateway.execute_with_fallback(msgs)
-        assert resp.provider == ProviderName.OPENAI
-        assert p_ai.call_count == 1
-        assert p_ant.call_count == 0
+    # Second failure -> Trips to OPEN
+    cb.record_failure()
+    assert cb.state == CircuitState.OPEN
+    assert cb.can_attempt() is False, "Open circuit must short-circuit attempts"
 
-        # Test 3: Failover trigger on 429
-        p_ai_fail = MockOpenAIProvider(should_fail=True)
-        p_ant_ok = MockAnthropicProvider(should_fail=False)
-        gw_fallback = ModelGateway([p_ai_fail, p_ant_ok])
-        resp2 = await gw_fallback.execute_with_fallback(msgs)
-        assert resp2.provider == ProviderName.ANTHROPIC
-        assert p_ai_fail.call_count == 1
-        assert p_ant_ok.call_count == 1
-        assert gw_fallback.failed_provider_attempts["openai"] == 1
+    # Wait for cooldown to expire
+    time.sleep(0.12)
+    assert cb.can_attempt() is True  # Enters HALF-OPEN
+    assert cb.state == CircuitState.HALF_OPEN
 
-        # Test 4: All providers fail raises RuntimeError
-        p_ant_fail = MockAnthropicProvider(should_fail=True)
-        gw_all_fail = ModelGateway([p_ai_fail, p_ant_fail])
-        caught = False
-        try:
-            await gw_all_fail.execute_with_fallback(msgs)
-        except RuntimeError:
-            caught = True
-        assert caught, "Should raise RuntimeError when all fail"
+    # Success in half-open resets to CLOSED
+    cb.record_success()
+    assert cb.state == CircuitState.CLOSED
 
-        # Test 5: Metrics accumulation
-        assert gw_fallback.total_tokens_consumed > 0
-        assert gw_fallback.total_spend_usd > 0.0
+    # ------------------------------------------------------------
+    # Test 4: Total Provider Exhaustion Exception Handling
+    # ------------------------------------------------------------
+    print("  -> Testing behavior when ALL providers in the gateway fail...")
+    failing_1 = MockOpenAIAdapter(simulate_outage=True)
+    failing_2 = MockOpenAIAdapter(simulate_outage=True)
+    failing_gateway = ModelGateway(providers=[failing_1, failing_2])
 
-        # Test 6: Temperature clamping
-        resp_clamp = await p_ant_ok.complete(msgs, temperature=1.8)
-        assert "temp 1.0" in resp_clamp.content, "Anthropic temperature should clamp to 1.0"
+    try:
+        failing_gateway.complete(req)
+        assert False, "Should raise RuntimeError when all providers fail"
+    except RuntimeError as err:
+        assert "All Model Gateway providers exhausted" in str(err)
 
-        # Test 7: Empty fallback chain validation
-        init_failed = False
-        try:
-            ModelGateway([])
-        except ValueError:
-            init_failed = True
-        assert init_failed, "Should reject empty fallback chain"
-
-        # Test 8: Gemini provider resolution
-        gemini = MockGeminiProvider()
-        gw_gemini = ModelGateway([gemini])
-        resp_gemini = await gw_gemini.execute_with_fallback(msgs)
-        assert resp_gemini.provider == ProviderName.GEMINI
-        assert "Gemini" in resp_gemini.content
-
-        # Test 9: Gateway message immutability
-        gm = GatewayMessage(role="user", content="Immutable test")
-        attr_failed = False
-        try:
-            gm.content = "Changed"  # type: ignore
-        except (AttributeError, TypeError):
-            attr_failed = True
-        assert attr_failed, "GatewayMessage should be frozen/immutable"
-
-        # Test 10: Latency tracking
-        assert resp2.latency_ms > 0, "Latency should be measured"
-
-    asyncio.run(_test_runner())
-    print("[SUCCESS] All 10 Model Gateway self-tests passed!")
+    print("[SUCCESS] All 4 Model Gateway & Provider Abstraction tests passed cleanly!")
 
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("Phase 11: Model Gateway & Provider Abstraction")
+    print("Phase 11 - 01: Universal Model Gateway, Adapters & Circuit Breakers")
     print("=" * 70)
-    asyncio.run(demonstrate_gateway_happy_path())
-    asyncio.run(demonstrate_gateway_automatic_failover())
-    print("-" * 70)
     run_tests()
     print("=" * 70)

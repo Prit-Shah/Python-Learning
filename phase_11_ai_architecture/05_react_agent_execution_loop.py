@@ -1,325 +1,437 @@
-"""
-Phase 11: ReAct Agent Architecture & Autonomous Tool Loops
-================================================================================
-1. CONCEPT & JS/TS ANALOGY:
-   - Concept: A ReAct (Reasoning + Acting) Agent interleaves thought generation
-     ("Reasoning") with tool invocations ("Acting"). Rather than a single prompt-
-     response, the agent operates in an autonomous loop:
-     Query -> [Thought -> Action -> Observation]* -> Final Answer.
-   - JS/TS Equivalent: Similar to an event-driven finite state machine (FSM)
-     or Redux middleware loop in Node.js, where actions trigger side-effects
-     that feed new state back into the reducer until a terminal state is reached.
-   - Key Architecture:
-     * Memory / Scratchpad: Keeps track of past thoughts, tool inputs, and outputs.
-     * Tool Registry: Maps tool names to executable functions with schemas.
-     * Guardrails: Halting conditions (Max Iterations, Cycle Detection, Token Cap).
+r"""
+05_react_agent_execution_loop.py
 
-2. UNDER THE HOOD (CPython & Memory):
-   - The Agent State Machine maintains an append-only conversation history.
-   - Self-Correction Mechanism: When a tool throws an error (e.g. invalid SQL
-     syntax or file not found), the error is formatted as an `Observation`
-     and returned to the model. The model reads the error and self-corrects its
-     next Action.
-   - Cycle Detection: Hashes `(tool_name, tool_arguments)`. If the identical
-     action is executed 3 times consecutively, the loop detects an infinite
-     thrashing pattern and forces an exit or changes the system instructions.
+============================================================
+1. CONCEPT
+============================================================
 
-3. COMMON GOTCHA:
-   - Runaway Cost & Infinite Loops: An agent that encounters an unexpected tool
-     failure can loop 50 times in 2 minutes, burning $20 of API tokens. You
-     MUST implement hard ceilings: `max_iterations = 6`, `timeout = 30.0`,
-     and `max_cost_usd = 0.50`.
-   - Tool Side-Effect Sandboxing: Never give an agent destructive commands
-     (`DROP TABLE`, `rm -rf`) without a human-in-the-loop approval gate.
+The ReAct (Reasoning + Acting) design pattern represents the foundational architecture
+of autonomous AI agents. Unlike passive single-turn chatbots, a ReAct agent operates in an
+iterative cognitive loop, decomposing complex goals into sequential reasoning steps, executing
+external tools, observing results, and self-correcting:
 
-4. 🎙️ INTERVIEW READINESS: VERBAL RESPONSE SCRIPT
-   - Interview Question: "Explain the ReAct agent architecture and how you
-     prevent infinite loops and hallucinations in production."
-   - How to Answer Out Loud (60-90 sec verbal script):
-     * "The ReAct pattern combines chain-of-thought reasoning with tool execution.
-       At each step, the model outputs a `Thought` explaining its hypothesis,
-       followed by an `Action` specifying the tool and arguments to execute."
-     * "The backend executes the tool and injects the output as an `Observation`.
-       The model uses this observation to decide the next step, repeating until
-       it concludes with `Final Answer`."
-     * "To make this production-safe, I implement three deterministic guardrails:
-       First, a hard iteration ceiling (e.g. max 5 steps). Second, cycle detection
-       that halts if the agent attempts the exact same action twice. Third, total
-       token and cost limits."
-     * "If a tool fails, we pass the error back as the observation so the agent
-       can self-correct. For irreversible actions like sending an email or
-       updating a database, we pause the loop and require Human-in-the-Loop
-       approval."
-================================================================================
+1. The ReAct Cognitive State Machine:
+   - The loop proceeds cyclically through four distinct phases:
+     $$\text{Goal} \longrightarrow [\text{Thought}_t \longrightarrow \text{Action}_t \longrightarrow \text{Observation}_t]^* \longrightarrow \text{Final Answer}$$
+     * Thought: The model generates explicit chain-of-thought reasoning explaining its hypothesis,
+       deductive logic, and current intent.
+     * Action: The model selects a specific tool and emits structured parameters:
+       `Action: search_database(table="users", query="alice")`.
+     * Observation: The host application executes the tool and injects the raw output back into
+       the agent's trajectory.
+     * Final Answer: When sufficient evidence has been accumulated, the agent synthesizes the
+       terminal response and halts the loop.
+
+2. Deterministic Guardrails & Termination Predicates:
+   - In production, agents MUST NEVER be allowed to run unconstrained:
+     * Iteration Ceiling (`max_iterations`): Hard cap (typically 5 to 10 steps) preventing runaway loops.
+     * Cycle / Thrashing Detection: Tracks action hashes $H(t) = \text{hash}(tool, args)$. If the
+       agent repeats the identical action consecutively, the loop interrupts the cycle.
+     * Total Cost / Token Ceiling: Aborts execution if cumulative token expenditure exceeds budget.
+
+3. Self-Correction via Environmental Feedback:
+   - Tools inevitably fail (e.g. database syntax error, 404 Not Found, invalid date format).
+   - Rather than crashing the process, the error is caught and formatted as an `Observation`:
+     `Observation: Error: Table 'user' does not exist. Did you mean 'users'?`
+   - The model observes its mistake and self-corrects its next Action.
+
+4. Human-in-the-Loop (HITL) Authorization Gate:
+   - Tools are partitioned by risk level:
+     * Safe / Read-Only (Search, Query, Calculate): Executed autonomously.
+     * Mutating / High-Impact (Send Email, Transfer Funds, Drop Table): Pauses the loop and
+       awaits explicit cryptographic or UI token confirmation from a human supervisor.
+
+
+============================================================
+2. JS / TS ANALOGY
+============================================================
+
++------------------------------+------------------------------------+------------------------------------+
+| Feature                      | Python (ReAct Agent Pattern)       | JavaScript / TypeScript (Node.js)  |
++------------------------------+------------------------------------+------------------------------------+
+| State Machine Loop           | While loop maintaining trajectory  | Async while loop / state machine   |
+| Trajectory Representation    | List of typed Pydantic dataclasses | Array of step objects / Redux log  |
+| Tool Execution Dispatch      | Dict lookup: `REGISTRY[name](**)`  | Object map: `tools[name].call()`   |
+| Cycle Detection              | Set of hashed action tuples        | Set of JSON-serialized strings     |
+| Human-in-the-Loop Gate       | Suspended generator / callback     | Async Promise resolution / webhook |
++------------------------------+------------------------------------+------------------------------------+
+
+Key JS vs Python Architecture Differences:
+1. In Node.js, agent frameworks often rely on asynchronous event emitters or Promise chains.
+2. In Python, an agent loop is typically modeled as a clean, synchronous or asynchronous state
+   machine where trajectory states are strictly typed, serializable, and auditable for debugging
+   and compliance replays.
+
+
+============================================================
+3. UNDER THE HOOD (Token Compounding & Cycle Detection)
+============================================================
+
+1. The $O(N^2)$ Trajectory Token Compounding Effect:
+   - On step 1, the model receives: `[System, Goal]`.
+   - On step 2, the model receives: `[System, Goal, Thought 1, Action 1, Observation 1]`.
+   - On step 3, the model receives: `[System, Goal, T1, A1, O1, T2, A2, O2]`.
+   - As trajectory length $N$ increases, input tokens scale quadratically: $\sum_{i=1}^N i \approx \frac{N^2}{2}$.
+   - Mitigation: Sliding window scratchpads or compacting intermediate observations into
+     summarized key-value bullet points.
+
+2. Loop Cycle Hashing:
+   - A cycle detector maintains an action history ring buffer.
+   - At each step: `action_signature = (action_name, frozenset(action_args.items()))`.
+   - If the same signature appears 2 times consecutively, the agent is stuck in an infinite
+     feedback trap. The engine interrupts the loop with a directive prompt:
+     `"You have repeated this action. You must choose an alternative approach or conclude."`
+
+
+============================================================
+4. COMMON GOTCHAS
+============================================================
+
+1. Uncaught Tool Exceptions Crashing the Process:
+   - Allowing Python exceptions (e.g. `KeyError`, `IndexError`) to propagate out of tools.
+   - This terminates the entire agent runtime instead of feeding the error back as an Observation.
+   - FIX: Always wrap tool execution in `try...except Exception as e:` and return the stringified error.
+
+2. Unbounded Runaway Loops Burning Capital:
+   - Deploying an agent with `while True:` without a strict `max_iterations` counter.
+   - An infinite loop can execute 100 API calls in 3 minutes, burning tens of dollars and
+     exhausting rate limit quotas.
+   - FIX: Hardcode `max_iterations = 6` with automated alerting on limit breach.
+
+3. Autonomous Execution of Destructive Mutations:
+   - Giving agents unfettered write access to production APIs or databases.
+   - FIX: Implement a mandatory Human-in-the-Loop authorization gate for all non-idempotent actions.
+
+
+============================================================
+5. INTERVIEW READINESS (VERBAL SCRIPTS)
+============================================================
+
+Q1: "Explain the ReAct pattern and how it fundamentally differs from standard prompt-response generation."
+A1: "The ReAct (Reasoning + Acting) pattern transforms an LLM from a one-shot text generator into an
+     autonomous decision-making agent.
+     In a standard prompt-response, the model generates an answer in a single forward pass without external feedback.
+     In ReAct, the model operates in a cyclical cognitive loop: it outputs a 'Thought' explaining its reasoning,
+     followed by an 'Action' requesting a tool execution. The application executes the tool and injects the
+     result as an 'Observation'. The model uses this observation to plan its next step, repeating until it
+     concludes with a 'Final Answer'.
+     This enables the model to gather real-time data, query private databases, and verify its own intermediate
+     hypotheses before providing an answer."
+
+Q2: "How do you make an autonomous ReAct agent production-ready and prevent runaway infinite loops?"
+A2: "I enforce four deterministic production guardrails:
+     First, a hard iteration limit ceiling (typically 5 to 8 steps). If exceeded, the agent halts and gracefully
+     reports that the task could not be resolved within budget.
+     Second, Cycle Detection: I hash the tool name and arguments at every step; if the agent attempts the identical
+     action consecutively, the engine breaks the loop to prevent thrashing.
+     Third, Error Reflection: all tool exceptions are caught and formatted as Observations, allowing the agent to
+     self-correct without crashing the host process.
+     Fourth, Human-in-the-Loop (HITL) gates: any mutating or high-risk action (such as deleting records or
+     executing financial transactions) pauses the loop and requires an explicit authorization token from a human
+     operator before proceeding."
+
+Q3: "Why does the ReAct loop experience quadratic token growth, and how do you optimize it?"
+A3: "At each step of a ReAct loop, the entire historical trajectory—every prior thought, action, and observation—must
+     be re-sent to the model so it retains memory of what it has already accomplished. This causes input tokens to
+     grow quadratically ($O(N^2)$) with the number of steps.
+     To optimize this, I implement two strategies:
+     First, Observation Truncation: raw tool responses (such as a 100-row database result) are truncated or summarized
+     before being added to the scratchpad, preserving only the relevant keys.
+     Second, Trajectory Compaction: for long-horizon tasks exceeding 6 steps, an intermediate summarization pass
+     compresses older thought-action-observation turns into a concise executive summary, keeping prompt sizes
+     bounded and predictable."
 """
 
 import sys
-if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
-    try: sys.stdout.reconfigure(encoding='utf-8')
-    except Exception: pass
-
 import json
+import warnings
+warnings.filterwarnings("ignore")
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+# Ensure UTF-8 output encoding across Windows terminals
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 
-# ── Agent State Models ───────────────────────────────────────────────────────
+# ==============================================================================
+# 1. TRAJECTORY STEP MODELS
+# ==============================================================================
+
+class StepType(str, Enum):
+    THOUGHT = "THOUGHT"
+    ACTION = "ACTION"
+    OBSERVATION = "OBSERVATION"
+    FINAL_ANSWER = "FINAL_ANSWER"
+
 
 @dataclass
 class AgentStep:
-    thought: str
-    action_tool: str | None = None
-    action_input: dict[str, Any] | None = None
-    observation: str | None = None
+    step_type: StepType
+    content: str
+    tool_name: Optional[str] = None
+    tool_args: Optional[Dict[str, Any]] = None
 
 
-@dataclass
-class AgentResult:
-    final_answer: str
-    total_steps: int
-    steps_history: list[AgentStep]
-    success: bool
-    termination_reason: str
+# ==============================================================================
+# 2. TOOL REGISTRY WITH HUMAN-IN-THE-LOOP (HITL) GATES
+# ==============================================================================
+
+class ToolMetadata:
+    def __init__(self, name: str, description: str, fn: Callable, is_mutating: bool = False):
+        self.name = name
+        self.description = description
+        self.fn = fn
+        self.is_mutating = is_mutating
 
 
-# ── Mock Tool Sandbox ────────────────────────────────────────────────────────
+class AgentToolRegistry:
+    """Manages agent tools and enforces Human-in-the-Loop authorization for mutations."""
 
-def tool_database_lookup(table: str, query: str) -> str:
-    """Mock database tool."""
-    if table == "users":
-        return json.dumps([{"id": 1, "name": "Alice", "role": "admin", "status": "active"}])
-    elif table == "orders":
-        return json.dumps([{"order_id": "ORD-99", "amount": 250.0, "status": "shipped"}])
-    return json.dumps({"error": f"Table '{table}' does not exist."})
+    def __init__(self):
+        self.tools: Dict[str, ToolMetadata] = {}
+
+    def register(self, name: str, description: str, fn: Callable, is_mutating: bool = False):
+        self.tools[name] = ToolMetadata(name, description, fn, is_mutating)
+
+    def execute(self, name: str, args: Dict[str, Any], human_approved: bool = False) -> str:
+        if name not in self.tools:
+            return f"Error: Tool '{name}' does not exist in registry."
+
+        tool = self.tools[name]
+
+        # Enforce Human-in-the-Loop authorization gate on mutating actions
+        if tool.is_mutating and not human_approved:
+            return f"BLOCKED: Action '{name}' is a mutating action requiring Human-in-the-Loop approval."
+
+        try:
+            result = tool.fn(**args)
+            return json.dumps(result) if not isinstance(result, str) else result
+        except Exception as e:
+            # Self-correction: Return error string so agent can observe its mistake
+            return f"Tool Execution Error: {type(e).__name__}: {str(e)}"
 
 
-def tool_calculator(expression: str) -> str:
-    """Mock calculator tool."""
-    allowed = set("0123456789+-*/.() ")
-    if not all(c in allowed for c in expression):
-        return json.dumps({"error": "Disallowed characters in math expression."})
-    try:
-        val = eval(expression)  # In production, use AST-based safe evaluator
-        return json.dumps({"result": val})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+# Concrete mock tools
+def mock_search_kb(query: str) -> str:
+    db = {
+        "refund_policy": "Full refunds are permitted within 30 days of purchase with receipt.",
+        "shipping_time": "Standard shipping takes 3-5 business days."
+    }
+    for k, v in db.items():
+        if k in query.lower():
+            return v
+    return "No matching records found in knowledge base."
 
 
-# ── Autonomous ReAct Execution Engine ────────────────────────────────────────
+def mock_database_query(user_id: int) -> Dict[str, Any]:
+    if user_id == 42:
+        return {"id": 42, "name": "Arthur Dent", "purchase_days_ago": 14, "item": "Sub-Etha Sensor"}
+    raise ValueError(f"Customer #{user_id} not found in database.")
+
+
+def mock_issue_refund(user_id: int, amount_usd: float) -> str:
+    return f"SUCCESS: Refund of ${amount_usd:.2f} issued to customer #{user_id}."
+
+
+# ==============================================================================
+# 3. REACT AGENT CORE ENGINE
+# ==============================================================================
 
 class ReActAgent:
     """
-    Production-grade ReAct agent loop with:
-    1. Multi-step reasoning
-    2. Tool dispatch & self-correction
-    3. Action cycle detection
-    4. Max iteration ceiling
+    Autonomous ReAct execution loop with:
+    - Thought -> Action -> Observation -> Final Answer sequence
+    - Hard iteration limit guardrail
+    - Consecutive action cycle detection
+    - Self-correction on tool errors
+    - Human-in-the-Loop authorization
     """
 
-    def __init__(self, max_iterations: int = 5):
+    def __init__(self, registry: AgentToolRegistry, max_iterations: int = 5):
+        self.registry = registry
         self.max_iterations = max_iterations
-        self.tools: dict[str, Callable[..., str]] = {
-            "database_lookup": tool_database_lookup,
-            "calculator": tool_calculator,
-        }
+        self.trajectory: List[AgentStep] = []
+        self._action_history: List[str] = []
 
-    def _mock_llm_decide_step(self, question: str, history: list[AgentStep]) -> tuple[str, str | None, dict[str, Any] | None]:
-        """
-        Simulates LLM next-step decision based on scratchpad history.
-        Returns: (Thought, ActionTool, ActionInput)
-        """
-        step_num = len(history) + 1
+    def _hash_action(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
+        serialized_args = json.dumps(tool_args, sort_keys=True)
+        return f"{tool_name}:{serialized_args}"
 
-        if "user" in question.lower() and "order" in question.lower():
-            if step_num == 1:
-                return (
-                    "I need to check user information first to find the user ID.",
-                    "database_lookup",
-                    {"table": "users", "query": "name=Alice"},
-                )
-            elif step_num == 2:
-                return (
-                    "User Alice has ID 1. Now I should query orders for user 1.",
-                    "database_lookup",
-                    {"table": "orders", "query": "user_id=1"},
-                )
-            elif step_num == 3:
-                return (
-                    "Order ORD-99 was found with amount $250. Now compute 10% discount.",
-                    "calculator",
-                    {"expression": "250 * 0.90"},
-                )
-            else:
-                return (
-                    "I have gathered the user details, order ORD-99, and discounted total of $225.",
-                    None,  # Terminal state: Final Answer
-                    None,
-                )
+    def run(
+        self,
+        goal: str,
+        simulated_llm_planner: Callable[[str, List[AgentStep]], Tuple[StepType, str, Optional[str], Optional[Dict[str, Any]]]],
+        human_approved_actions: Set[str] = set()
+    ) -> str:
+        self.trajectory.clear()
+        self._action_history.clear()
 
-        # Fallback for simple calculation
-        if "calc" in question.lower():
-            if step_num == 1:
-                return ("Calculate the total.", "calculator", {"expression": "100 + 45"})
-            return ("Calculation complete.", None, None)
+        iteration = 0
+        while iteration < self.max_iterations:
+            iteration += 1
 
-        return ("I can answer this directly without tools.", None, None)
+            # 1. LLM plans next step based on goal and past trajectory
+            step_type, text_content, tool_name, tool_args = simulated_llm_planner(goal, self.trajectory)
 
-    def run(self, user_question: str) -> AgentResult:
-        """Executes the autonomous reasoning loop."""
-        history: list[AgentStep] = []
-        action_signatures_seen: list[str] = []
+            if step_type == StepType.FINAL_ANSWER:
+                self.trajectory.append(AgentStep(StepType.FINAL_ANSWER, content=text_content))
+                return text_content
 
-        print(f"  [AGENT START] Goal: '{user_question}'")
+            if step_type == StepType.THOUGHT:
+                self.trajectory.append(AgentStep(StepType.THOUGHT, content=text_content))
 
-        for iteration in range(1, self.max_iterations + 1):
-            thought, tool_name, tool_input = self._mock_llm_decide_step(user_question, history)
+            elif step_type == StepType.ACTION:
+                assert tool_name is not None and tool_args is not None
+                action_hash = self._hash_action(tool_name, tool_args)
 
-            step = AgentStep(thought=thought, action_tool=tool_name, action_input=tool_input)
+                # Cycle Detection: halt if exact same action executed twice consecutively
+                if len(self._action_history) >= 1 and self._action_history[-1] == action_hash:
+                    error_msg = f"Loop Cycle Detected: Agent repeated action '{tool_name}' with identical parameters."
+                    self.trajectory.append(AgentStep(StepType.OBSERVATION, content=error_msg))
+                    return f"Agent Halted: {error_msg}"
 
-            # Check for Final Answer (terminal state)
-            if tool_name is None:
-                history.append(step)
-                print(f"    Step {iteration} [FINAL ANSWER]: {thought}")
-                return AgentResult(
-                    final_answer=thought,
-                    total_steps=iteration,
-                    steps_history=history,
-                    success=True,
-                    termination_reason="goal_achieved",
-                )
+                self._action_history.append(action_hash)
+                self.trajectory.append(AgentStep(StepType.ACTION, content=text_content, tool_name=tool_name, tool_args=tool_args))
 
-            # Cycle Detection: Detect if identical action was already executed
-            action_sig = f"{tool_name}:{json.dumps(tool_input, sort_keys=True)}"
-            if action_signatures_seen.count(action_sig) >= 2:
-                print(f"    [CYCLE DETECTED] Action '{action_sig}' repeated 3 times. Breaking loop!")
-                return AgentResult(
-                    final_answer="Aborted due to cyclic thrashing.",
-                    total_steps=iteration,
-                    steps_history=history,
-                    success=False,
-                    termination_reason="cycle_detected",
-                )
-            action_signatures_seen.append(action_sig)
+                # Check Human-in-the-Loop approval
+                is_approved = action_hash in human_approved_actions
 
-            print(f"    Step {iteration} [THOUGHT]: {thought}")
-            print(f"           [ACTION]:  {tool_name}({tool_input})")
+                # 2. Execute tool and inject Observation
+                observation = self.registry.execute(tool_name, tool_args, human_approved=is_approved)
+                self.trajectory.append(AgentStep(StepType.OBSERVATION, content=observation))
 
-            # Execute tool safely
-            tool_fn = self.tools.get(tool_name)
-            if not tool_fn:
-                observation = json.dumps({"error": f"Tool '{tool_name}' not found."})
-            else:
-                try:
-                    observation = tool_fn(**(tool_input or {}))
-                except Exception as e:
-                    observation = json.dumps({"error": f"Tool exception: {str(e)}"})
-
-            step.observation = observation
-            print(f"           [OBSERV]:  {observation[:60]}...")
-            history.append(step)
-
-        # Max iterations reached
-        print(f"    [HALTED] Max iterations ({self.max_iterations}) exceeded.")
-        return AgentResult(
-            final_answer="Reached maximum iteration limit without terminal state.",
-            total_steps=self.max_iterations,
-            steps_history=history,
-            success=False,
-            termination_reason="max_iterations_exceeded",
-        )
+        return "Agent Halted: Maximum iteration limit reached without concluding."
 
 
-# ── Demonstration Functions ──────────────────────────────────────────────────
+# ==============================================================================
+# 4. SELF-TESTING SUITE
+# ==============================================================================
 
-def demonstrate_react_agent_execution():
-    """Demonstrates multi-step ReAct agent achieving a multi-hop goal."""
-    print("  --- Demonstration: Multi-Step Autonomous ReAct Loop ---")
-    agent = ReActAgent(max_iterations=6)
-    question = "Find Alice's orders and calculate the price with 10% discount"
-    result = agent.run(question)
+def run_tests() -> None:
+    print("\n[*] Starting automated test suite for 05_react_agent_execution_loop.py...")
 
-    print(f"\n    Status: {'SUCCESS' if result.success else 'FAILED'}")
-    print(f"    Termination Reason: {result.termination_reason}")
-    print(f"    Total Steps: {result.total_steps}")
-    print(f"    Final Answer: {result.final_answer}")
-    return result
+    registry = AgentToolRegistry()
+    registry.register("search_kb", "Search company knowledge base", mock_search_kb, is_mutating=False)
+    registry.register("get_customer", "Lookup customer purchase record", mock_database_query, is_mutating=False)
+    registry.register("issue_refund", "Refund customer funds", mock_issue_refund, is_mutating=True)
 
+    agent = ReActAgent(registry, max_iterations=6)
 
-# ══════════════════════════════════════════════════════════════════════
-# SELF-TEST CHALLENGES
-# ══════════════════════════════════════════════════════════════════════
+    # ------------------------------------------------------------
+    # Test 1: Full Autonomous Goal Completion (Thought -> Action -> Observation -> Final Answer)
+    # ------------------------------------------------------------
+    print("  -> Testing full autonomous ReAct trajectory to Final Answer...")
+    # Mock planner that simulates an LLM resolving a refund inquiry
+    plan_step = 0
+    def mock_planner_success(goal: str, traj: List[AgentStep]):
+        nonlocal plan_step
+        plan_step += 1
+        if plan_step == 1:
+            return StepType.ACTION, "Looking up customer record", "get_customer", {"user_id": 42}
+        elif plan_step == 2:
+            return StepType.ACTION, "Checking refund policy", "search_kb", {"query": "refund_policy"}
+        else:
+            return StepType.FINAL_ANSWER, "Customer Arthur Dent is eligible for refund (purchased 14 days ago, policy is 30 days).", None, None
 
-def run_tests():
-    """Automated verification for Phase 11 File 5."""
-    print("\n[*] Running automated self-tests...")
+    final_ans = agent.run("Can customer 42 get a refund?", mock_planner_success)
+    assert "Arthur Dent is eligible" in final_ans
+    assert len(agent.trajectory) == 5  # Action1, Obs1, Action2, Obs2, FinalAnswer
+    assert agent.trajectory[0].step_type == StepType.ACTION
+    assert agent.trajectory[1].step_type == StepType.OBSERVATION
+    assert agent.trajectory[-1].step_type == StepType.FINAL_ANSWER
 
-    agent = ReActAgent(max_iterations=5)
+    # ------------------------------------------------------------
+    # Test 2: Error Self-Correction via Observation
+    # ------------------------------------------------------------
+    print("  -> Testing agent self-correction after tool execution error...")
+    error_step = 0
+    def mock_planner_error_recovery(goal: str, traj: List[AgentStep]):
+        nonlocal error_step
+        error_step += 1
+        if error_step == 1:
+            # Mistake: queries non-existent user 999
+            return StepType.ACTION, "Checking user", "get_customer", {"user_id": 999}
+        elif error_step == 2:
+            # Inspect previous observation: saw error, now self-corrects to user 42
+            last_obs = traj[-1].content
+            assert "ValueError" in last_obs
+            return StepType.ACTION, "Correcting to user 42", "get_customer", {"user_id": 42}
+        else:
+            return StepType.FINAL_ANSWER, "Found customer Arthur Dent after correction.", None, None
 
-    # Test 1: Direct answer without tools
-    res1 = agent.run("What is your name?")
-    assert res1.success is True
-    assert res1.total_steps == 1
-    assert res1.termination_reason == "goal_achieved"
+    ans_recovered = agent.run("Find customer details", mock_planner_error_recovery)
+    assert "Arthur Dent" in ans_recovered
+    # Trajectory must show the error observation followed by the self-corrected action
+    assert "ValueError" in agent.trajectory[1].content
+    assert agent.trajectory[2].tool_args == {"user_id": 42}
 
-    # Test 2: Single tool invocation
-    res2 = agent.run("Please calc 100 + 45")
-    assert res2.success is True
-    assert res2.total_steps == 2
-    assert res2.steps_history[0].action_tool == "calculator"
+    # ------------------------------------------------------------
+    # Test 3: Cycle / Thrashing Detection Guardrail
+    # ------------------------------------------------------------
+    print("  -> Testing cycle detector halts infinite loop on duplicate actions...")
+    def mock_planner_infinite_cycle(goal: str, traj: List[AgentStep]):
+        # Erroneously repeats the exact same action repeatedly
+        return StepType.ACTION, "Retrying query", "search_kb", {"query": "missing_item"}
 
-    # Test 3: Multi-step tool execution
-    res3 = agent.run("Find Alice's user info and order")
-    assert res3.success is True
-    assert res3.total_steps == 4
-    assert len(res3.steps_history) == 4
+    halt_msg = agent.run("Find missing item", mock_planner_infinite_cycle)
+    assert "Loop Cycle Detected" in halt_msg
+    assert "Agent Halted" in halt_msg
 
-    # Test 4: Database tool handles unknown table
-    err_res = tool_database_lookup("nonexistent", "")
-    assert "error" in err_res
+    # ------------------------------------------------------------
+    # Test 4: Maximum Iterations Ceiling Guardrail
+    # ------------------------------------------------------------
+    print("  -> Testing maximum iteration ceiling prevents runaway execution...")
+    infinite_step = 0
+    def mock_planner_never_concludes(goal: str, traj: List[AgentStep]):
+        nonlocal infinite_step
+        infinite_step += 1
+        # Slightly modifies query so cycle detector doesn't trip, but never concludes
+        return StepType.ACTION, f"Step {infinite_step}", "search_kb", {"query": f"item_{infinite_step}"}
 
-    # Test 5: Calculator tool handles disallowed characters
-    calc_err = tool_calculator("import os; os.system('ls')")
-    assert "error" in calc_err
+    short_agent = ReActAgent(registry, max_iterations=3)
+    limit_msg = short_agent.run("Run forever", mock_planner_never_concludes)
+    assert "Maximum iteration limit reached" in limit_msg
 
-    # Test 6: Calculator tool evaluates valid math
-    calc_ok = tool_calculator("25 * 4")
-    assert json.loads(calc_ok)["result"] == 100
+    # ------------------------------------------------------------
+    # Test 5: Human-in-the-Loop (HITL) Authorization Gate
+    # ------------------------------------------------------------
+    print("  -> Testing Human-in-the-Loop authorization gate for mutating actions...")
+    def mock_planner_refund(goal: str, traj: List[AgentStep]):
+        return StepType.ACTION, "Issuing refund", "issue_refund", {"user_id": 42, "amount_usd": 85.00}
 
-    # Test 7: Max iteration ceiling halts execution
-    capped_agent = ReActAgent(max_iterations=2)
-    res_capped = capped_agent.run("Find Alice's user info and order")
-    assert res_capped.success is False
-    assert res_capped.termination_reason == "max_iterations_exceeded"
-    assert res_capped.total_steps == 2
+    # Case A: Without human approval -> BLOCKED (trips cycle detection or halts)
+    blocked_res = agent.run("Refund Arthur", mock_planner_refund)
+    assert "Agent Halted" in blocked_res
+    assert "BLOCKED: Action 'issue_refund' is a mutating action" in agent.trajectory[1].content
 
-    # Test 8: Agent step data structure
-    step = AgentStep(thought="Thinking", action_tool="calc", action_input={"x": 1}, observation="10")
-    assert step.thought == "Thinking"
-    assert step.observation == "10"
+    # Case B: With human approval token -> ALLOWED
+    action_signature = agent._hash_action("issue_refund", {"user_id": 42, "amount_usd": 85.00})
+    success_refund_agent = ReActAgent(registry, max_iterations=2)
 
-    # Test 9: Tool lookup error handling
-    agent_bad_tool = ReActAgent()
-    # Replace decide step to call missing tool
-    agent_bad_tool._mock_llm_decide_step = lambda q, h: ("Thought", "unknown_tool", {})
-    bad_res = agent_bad_tool.run("Test unknown tool")
-    assert not bad_res.success
-    assert "unknown_tool" in bad_res.steps_history[0].action_tool
+    def mock_planner_single_refund(goal: str, traj: List[AgentStep]):
+        if len(traj) == 0:
+            return StepType.ACTION, "Issuing refund", "issue_refund", {"user_id": 42, "amount_usd": 85.00}
+        return StepType.FINAL_ANSWER, "Refund successfully completed.", None, None
 
-    # Test 10: Cycle detection guardrail
-    cycle_agent = ReActAgent(max_iterations=10)
-    cycle_agent._mock_llm_decide_step = lambda q, h: ("Looping thought", "calculator", {"expression": "1+1"})
-    cycle_res = cycle_agent.run("Force cycle")
-    assert cycle_res.success is False
-    assert cycle_res.termination_reason == "cycle_detected"
+    approved_res = success_refund_agent.run(
+        "Refund Arthur",
+        mock_planner_single_refund,
+        human_approved_actions={action_signature}
+    )
+    assert approved_res == "Refund successfully completed."
+    assert "SUCCESS: Refund of $85.00" in success_refund_agent.trajectory[1].content
 
-    print("[SUCCESS] All 10 ReAct Agent self-tests passed!")
+    print("[SUCCESS] All 5 ReAct Agent Execution Loop tests passed cleanly!")
 
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("Phase 11: ReAct Agent Architecture & Autonomous Tool Loops")
+    print("Phase 11 - 05: ReAct Autonomous Agent Execution Loop & Guardrails")
     print("=" * 70)
-    demonstrate_react_agent_execution()
-    print("-" * 70)
     run_tests()
     print("=" * 70)
